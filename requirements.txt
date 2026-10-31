@@ -5,6 +5,5 @@ aiohttp==3.10.5
 setuptools<70
 pillow
 qrcode
-
-
-
+numpy
+httpx

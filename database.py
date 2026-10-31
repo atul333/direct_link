@@ -184,6 +184,36 @@ def upsert_user(db_path: str, user_id: int, username: str,
     conn.close()
 
 
+def upsert_central_user(shared_db_path: str, user_id: int, username: str, first_name: str) -> None:
+    """Safely upsert user into central shared DB."""
+    if not shared_db_path:
+        return
+    try:
+        conn = sqlite3.connect(shared_db_path, timeout=5)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS shared_users (
+                user_id     INTEGER PRIMARY KEY,
+                username    TEXT,
+                first_name  TEXT,
+                updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        uname = format_username(username)
+        conn.execute("""
+            INSERT INTO shared_users (user_id, username, first_name, updated_at)
+            VALUES (?, ?, ?, datetime('now'))
+            ON CONFLICT(user_id) DO UPDATE SET
+                username   = excluded.username,
+                first_name = excluded.first_name,
+                updated_at = excluded.updated_at
+        """, (user_id, uname, first_name))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.debug("Could not upsert central user: %s", e)
+
+
 def get_all_users(db_path: str) -> list:
     conn = get_connection(db_path)
     rows = conn.execute(

@@ -47,7 +47,7 @@ from telegram.constants import ParseMode, ChatMemberStatus
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes, ConversationHandler,
-    ChatJoinRequestHandler, ChatMemberHandler,
+    ChatJoinRequestHandler, ChatMemberHandler, TypeHandler,
 )
 
 import database as db
@@ -77,6 +77,32 @@ MANDATORY_CHANNELS = [
     int(x.strip()) for x in MANDATORY_CHANNELS_RAW.split(",") if x.strip()
 ]
 ADMIN_CONTACT      = os.getenv("ADMIN_CONTACT", "@videos69_Admin_Bot")
+
+SHARED_DB_PATH = os.getenv("SHARED_PREMIUM_DB", "/home/ubuntu/premium_shared.db")
+_known_users_cache: dict[int, str] = {}
+
+
+async def track_user_action_fast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Zero-load user tracker: updates database only when user is new or username changed."""
+    user = update.effective_user
+    if not user or user.is_bot:
+        return
+    uid = user.id
+    raw_uname = user.username
+    uname = f"@{raw_uname.lstrip('@')}" if raw_uname else ""
+    if uid in _known_users_cache and _known_users_cache[uid] == uname:
+        return
+    _known_users_cache[uid] = uname
+    fname = user.first_name or ""
+    lname = user.last_name or ""
+    try:
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, db.upsert_user, DB_PATH, uid, uname, fname, lname)
+        if SHARED_DB_PATH:
+            loop.run_in_executor(None, db.upsert_central_user, SHARED_DB_PATH, uid, uname, fname)
+    except Exception:
+        pass
+
 
 # ── Conversation states ────────────────────────────────────────────────────────
 (
@@ -2974,10 +3000,7 @@ async def render_post_preview(message, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             header_text = (
                 f"🎁 <b>EXCLUSIVE FREE VIP CHANNEL ACCESS</b> 🎁\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🌟 <b>Channel:</b> <b>{ch_name}</b>\n\n"
-                f"• 🚀 <i>Daily High-Quality Exclusive Updates & Leaks</i>\n"
-                f"• 🔒 <i>100% Private, Safe & Verified Content</i>\n"
-                f"• ⚡ <i>Instant Automated 100% Free Access — No Payment Required!</i>\n\n"
+                f"🌟 <b>Channel:</b> <b>{ch_name}</b>\n"
             )
         price_line = "💰 <b>Access Fee:</b> <b>FREE (₹0) 🎁</b>\n"
         payment_mode_line = "⚡ <b>Instant Access:</b> Zero Payment • 100% Free Join\n"
@@ -2995,10 +3018,7 @@ async def render_post_preview(message, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             header_text = (
                 f"🔥 <b>EXCLUSIVE VIP CHANNEL ACCESS</b> 🔥\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🌟 <b>Channel:</b> <b>{ch_name}</b>\n\n"
-                f"• 🚀 <i>Daily High-Quality Exclusive Updates & Leaks</i>\n"
-                f"• 🔒 <i>100% Private, Safe & Verified Content</i>\n"
-                f"• ⚡ <i>Instant Automated Access & Delivery</i>\n\n"
+                f"🌟 <b>Channel:</b> <b>{ch_name}</b>\n"
             )
 
         cross_price = ctx.user_data.get("post_cross_price")
@@ -3022,7 +3042,6 @@ async def render_post_preview(message, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         f"╔════════════════════════════════════╗\n"
         f"  ⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b>\n"
         f"╚════════════════════════════════════╝\n\n"
-        f"🏆Admin - {ADMIN_CONTACT}\n\n"
         f"{action_line}"
     )
     if photo_file_id and len(preview_caption) > 1024:
@@ -3589,6 +3608,9 @@ def main() -> None:
     app.add_handler(edit_channel_conv)
     app.add_handler(broadcast_conv)
     app.add_handler(verify_conv)
+
+    # Zero-load action tracker: records username in DB for ANY user interaction (group=-10 runs first)
+    app.add_handler(TypeHandler(Update, track_user_action_fast), group=-10)
 
     # Join request firewall handler (anti-leak protection)
     app.add_handler(ChatJoinRequestHandler(handle_chat_join_request))
