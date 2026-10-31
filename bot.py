@@ -3465,6 +3465,13 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
 
 
 def main() -> None:
+    # Ensure an asyncio event loop exists in MainThread (required for Python 3.12/3.14+)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN is not set in .env")
     if not ADMIN_IDS:
@@ -3535,6 +3542,7 @@ def main() -> None:
             ],
         },
         fallbacks=[cancel_handler],
+        per_message=False,
     )
 
     # ── Edit Channel conversation ────────────────────────────────────────────
@@ -3548,6 +3556,7 @@ def main() -> None:
             EC_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ec_get_value)],
         },
         fallbacks=[cancel_handler],
+        per_message=False,
     )
 
     # ── Broadcast conversation ───────────────────────────────────────────────
@@ -3571,6 +3580,7 @@ def main() -> None:
             VERIFY_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_verify_id)],
         },
         fallbacks=[cancel_handler],
+        per_message=False,
     )
 
     # ── Register all handlers ────────────────────────────────────────────────
@@ -3626,5 +3636,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
     main()
 
