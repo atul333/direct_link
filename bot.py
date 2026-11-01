@@ -64,11 +64,13 @@ logger = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 BOT_TOKEN          = os.getenv("BOT_TOKEN", "")
+BOT_ID             = int(BOT_TOKEN.split(":")[0]) if ":" in BOT_TOKEN else 0
+BOT_USERNAME       = os.getenv("BOT_USERNAME", "DirectChannelLink_A1_bot")
 ADMIN_IDS          = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 RZP_KEY_ID         = os.getenv("RAZORPAY_KEY_ID", "")
 RZP_KEY_SECRET     = os.getenv("RAZORPAY_KEY_SECRET", "")
 RZP_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
-WEBHOOK_PORT       = int(os.getenv("WEBHOOK_PORT", "8000"))
+WEBHOOK_PORT       = int(os.getenv("WEBHOOK_PORT", "5000"))
 DB_PATH            = os.getenv("DATABASE_PATH", "bot_data.db")
 BROADCAST_DELAY    = float(os.getenv("BROADCAST_DELAY", "0.05"))
 MAIN_CHANNEL_ID    = os.getenv("MAIN_CHANNEL_ID", "")
@@ -633,7 +635,7 @@ async def process_successful_payment(
 
 
 async def handle_razorpay_webhook(request: web.Request) -> web.Response:
-    """Process incoming Razorpay webhook events."""
+    """Process incoming Razorpay webhook events with strict bot and port isolation."""
     try:
         body = await request.read()
         sig = request.headers.get("X-Razorpay-Signature", "")
@@ -645,7 +647,7 @@ async def handle_razorpay_webhook(request: web.Request) -> web.Response:
 
         data = json.loads(body.decode("utf-8"))
         event = data.get("event", "")
-        logger.info("Razorpay webhook event received: %s", event)
+        logger.info("Razorpay webhook event received on port %d: %s", WEBHOOK_PORT, event)
 
         if event in ("order.paid", "payment.captured", "qr_code.credited"):
             payload = data.get("payload", {})
@@ -653,42 +655,89 @@ async def handle_razorpay_webhook(request: web.Request) -> web.Response:
             order_entity = payload.get("order", {}).get("entity", {})
             qr_entity = payload.get("qr_code", {}).get("entity", {})
 
-            # 1. Filter by bot tag in notes (if created by another bot sharing this Razorpay account)
-            notes = (
-                payment_entity.get("notes") or
-                order_entity.get("notes") or
-                qr_entity.get("notes") or {}
-            )
-            bot_tag = notes.get("bot") or notes.get("bot_username")
-            if bot_tag and bot_tag != "DirectChannelLink_A1_bot":
-                logger.info("Webhook for other bot '%s'. Ignored.", bot_tag)
-                return web.json_response({"status": "ignored", "reason": "different_bot"})
+            # Consolidate notes from qr_code, order, and payment entities
+            notes = {}
+            for ent in (qr_entity, order_entity, payment_entity):
+                if ent and isinstance(ent.get("notes"), dict):
+                    notes.update(ent["notes"])
 
+            # 1. Port isolation check — ignore events intended for another bot's port
+            req_port = str(notes.get("port") or notes.get("webhook_port") or "").strip()
+            if req_port and req_port != str(WEBHOOK_PORT):
+                logger.info(
+                    "Webhook port mismatch: event port is %s, this bot listens on %s. Ignored.",
+                    req_port, WEBHOOK_PORT,
+                )
+                return web.json_response({
+                    "status": "ignored",
+                    "reason": "different_port",
+                    "received_port": req_port,
+                    "bot_port": WEBHOOK_PORT,
+                })
+
+            # 2. Bot ID / Bot Number isolation check
+            req_bot_id = str(notes.get("bot_id") or notes.get("bot_number") or "").strip()
+            if req_bot_id and str(BOT_ID) and req_bot_id != str(BOT_ID):
+                logger.info(
+                    "Webhook bot_id mismatch: event bot_id is %s, this bot is %s. Ignored.",
+                    req_bot_id, BOT_ID,
+                )
+                return web.json_response({
+                    "status": "ignored",
+                    "reason": "different_bot_id",
+                    "received_bot_id": req_bot_id,
+                    "this_bot_id": str(BOT_ID),
+                })
+
+            # 3. Bot username isolation check
+            bot_tag = str(notes.get("bot") or notes.get("bot_username") or "").strip()
+            if bot_tag and BOT_USERNAME and bot_tag.lower() != BOT_USERNAME.lower():
+                logger.info(
+                    "Webhook bot_username mismatch: event bot is '%s', this bot is '%s'. Ignored.",
+                    bot_tag, BOT_USERNAME,
+                )
+                return web.json_response({
+                    "status": "ignored",
+                    "reason": "different_bot",
+                    "received_bot": bot_tag,
+                    "this_bot": BOT_USERNAME,
+                })
+
+            # 4. Reference ID extraction
             ref_id = (
                 payment_entity.get("order_id") or
                 qr_entity.get("id") or
                 order_entity.get("id") or
-                payment_entity.get("notes", {}).get("qr_id") or
-                payment_entity.get("notes", {}).get("order_id")
+                notes.get("qr_id") or
+                notes.get("order_id")
             )
             if not ref_id:
+                logger.info("Webhook event has no reference ID. Ignored.")
                 return web.json_response({"status": "ignored", "reason": "no_ref_id"})
 
-            # 2. Filter by database record (if not found in this bot's DB, it belongs to another bot)
+            # 5. Database record verification — ensures QR was generated in THIS bot's database
             payment = db.find_payment(DB_PATH, ref_id)
             if not payment:
-                logger.info("Webhook ref %s does not belong to this bot's database. Ignored.", ref_id)
-                return web.json_response({"status": "ignored", "reason": "not_in_db"})
+                logger.info(
+                    "Webhook ref %s does not exist in this bot's database (%s). Ignored.",
+                    ref_id, DB_PATH,
+                )
+                return web.json_response({
+                    "status": "ignored",
+                    "reason": "not_in_db",
+                    "ref_id": ref_id,
+                })
 
             payment_id = payment_entity.get("id") or ""
             amount_paise = payment_entity.get("amount") or order_entity.get("amount") or qr_entity.get("payment_amount") or 0
             amount_inr = (amount_paise / 100.0) if amount_paise else None
             method = payment_entity.get("method", "UPI QR Webhook")
 
+            logger.info("Processing verified payment for this bot: ref_id=%s, payment_id=%s, amount=₹%s", ref_id, payment_id, amount_inr)
             bot = request.app["bot"]
             await process_successful_payment(bot, ref_id, payment_id, amount_inr, method)
 
-        return web.json_response({"status": "ok"})
+        return web.json_response({"status": "ok", "bot_id": str(BOT_ID), "port": WEBHOOK_PORT})
     except Exception as exc:
         logger.error("Razorpay webhook error: %s", exc)
         return web.Response(status=500, text=str(exc))
@@ -698,7 +747,10 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({
         "status": "online",
         "service": "Razorpay Auto-Approval Webhook",
-        "bot": "DirectChannelLink_A1_bot"
+        "bot_id": BOT_ID,
+        "bot_number": str(BOT_ID),
+        "bot_username": BOT_USERNAME,
+        "port": WEBHOOK_PORT,
     })
 
 
@@ -706,8 +758,12 @@ async def start_webhook_server(bot) -> web.AppRunner:
     """Start local aiohttp webhook server."""
     web_app = web.Application()
     web_app["bot"] = bot
+    web_app.router.add_post("/razorpay-webhook", handle_razorpay_webhook)
+    web_app.router.add_post("/razorpay_webhook", handle_razorpay_webhook)
     web_app.router.add_post("/webhook/razorpay", handle_razorpay_webhook)
     web_app.router.add_post("/webhook", handle_razorpay_webhook)
+    web_app.router.add_get("/razorpay-webhook", handle_health)
+    web_app.router.add_get("/razorpay_webhook", handle_health)
     web_app.router.add_get("/", handle_health)
     web_app.router.add_get("/health", handle_health)
 
@@ -715,7 +771,7 @@ async def start_webhook_server(bot) -> web.AppRunner:
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
     await site.start()
-    logger.info("Razorpay Webhook server running on http://0.0.0.0:%d/webhook/razorpay", WEBHOOK_PORT)
+    logger.info("Razorpay Webhook server running on http://0.0.0.0:%d/razorpay-webhook", WEBHOOK_PORT)
     return runner
 
 
@@ -1195,7 +1251,12 @@ def _blocking_get_or_create_qr(
     notes = {
         "user_id": str(user_id),
         "channel_id": str(channel_id),
-        "bot": "DirectChannelLink_A1_bot",
+        "bot": BOT_USERNAME,
+        "bot_username": BOT_USERNAME,
+        "bot_id": str(BOT_ID),
+        "bot_number": str(BOT_ID),
+        "port": str(WEBHOOK_PORT),
+        "webhook_port": str(WEBHOOK_PORT),
     }
     if post_id:
         notes["post_id"] = str(post_id)
@@ -3356,6 +3417,15 @@ async def handle_chat_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYP
 
 async def post_init(app: Application) -> None:
     """Start Webhook server, background poller, and set bot commands."""
+    global BOT_ID, BOT_USERNAME
+    try:
+        me = await app.bot.get_me()
+        BOT_ID = me.id
+        BOT_USERNAME = me.username or BOT_USERNAME
+        logger.info("Bot authenticated: @%s (Bot ID: %s, Webhook Port: %d)", BOT_USERNAME, BOT_ID, WEBHOOK_PORT)
+    except Exception as exc:
+        logger.warning("Could not refresh bot profile in post_init: %s", exc)
+
     # 1. Start Webhook server for Razorpay
     try:
         runner = await start_webhook_server(app.bot)

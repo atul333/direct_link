@@ -52,7 +52,7 @@ def create_upi_qr(client: razorpay.Client, amount_inr: float,
         "notes": notes or {},
     }
     qr = client.qrcode.create(data=data)
-    logger.info("Razorpay UPI QR created: %s, amount=₹%.2f", qr["id"], amount_inr)
+    logger.info("Razorpay UPI QR created: %s, amount=₹%.2f, notes=%s", qr["id"], amount_inr, notes)
     return qr
 
 
