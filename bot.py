@@ -610,18 +610,23 @@ async def process_successful_payment(
     # ── Notify admins (only on first approval) ────────────────────────────────
     if not already_paid:
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        isolated_tx_id = f"CLP5000-{payment_id}" if payment_id and not payment_id.startswith("CLP") else (payment_id or "N/A")
+        isolated_ref_id = f"CLP5000-{order_id}" if order_id and not order_id.startswith("CLP") else order_id
+
         admin_text = (
-            "💸 <b>New Sale! Payment Auto-Approved</b>\n\n"
+            "<blockquote><b>💸 New Sale! Payment Auto-Approved</b></blockquote>\n"
+            "<blockquote>"
             f"👤 <b>User ID:</b> <code>{user_id}</code>\n"
             f"👤 <b>Username:</b> {uname}\n"
             f"👤 <b>Name:</b> {full_name}\n"
             f"🏷️ <b>Channel:</b> <b>{channel['name'] if channel else f'Channel #{channel_id}'}</b>\n"
             f"💰 <b>Amount Paid:</b> <b>₹{amount:.0f}</b>\n"
-            f"🧾 <b>Payment Ref:</b> <code>{order_id}</code>\n"
-            f"💳 <b>Transaction ID:</b> <code>{payment_id}</code>\n"
+            f"🔒 <b>Isolated Port:</b> <code>{WEBHOOK_PORT}</code>\n"
+            f"🧾 <b>Payment Ref:</b> <code>{isolated_ref_id}</code>\n"
+            f"💳 <b>Transaction ID:</b> <code>{isolated_tx_id}</code>\n"
             f"📲 <b>Method:</b> {method or 'UPI / Auto'}\n"
-            f"⏱️ <b>Time:</b> {now_str}\n\n"
-            f"✅ <i>Access link delivered with anti-leak protection!</i>"
+            f"⏱️ <b>Time:</b> {now_str}</blockquote>\n\n"
+            f"✅ <i>Access link delivered with anti-leak protection! (Port {WEBHOOK_PORT} only)</i>"
         )
         for aid in get_admin_ids():
             try:
