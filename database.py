@@ -407,15 +407,18 @@ def get_payment_by_order(db_path: str, order_id: str) -> Optional[sqlite3.Row]:
 
 
 def find_payment(db_path: str, identifier: str) -> Optional[sqlite3.Row]:
-    """Search for payment record by order_id, qr_id, or payment_id."""
-    clean_id = identifier.strip()
+    """Search for payment record by order_id, qr_id, or payment_id (supports CLP5000- prefix)."""
+    clean_id = identifier.replace("CLP5000-", "").strip()
+    raw_id = identifier.strip()
     conn = get_connection(db_path)
     row = conn.execute("""
         SELECT * FROM payments 
         WHERE razorpay_order_id = ? 
            OR razorpay_payment_id = ?
+           OR razorpay_order_id = ?
+           OR razorpay_payment_id = ?
         ORDER BY created_at DESC LIMIT 1
-    """, (clean_id, clean_id)).fetchone()
+    """, (clean_id, clean_id, raw_id, raw_id)).fetchone()
     conn.close()
     return row
 

@@ -64,11 +64,13 @@ logger = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 BOT_TOKEN          = os.getenv("BOT_TOKEN", "")
+BOT_ID             = int(BOT_TOKEN.split(":")[0]) if ":" in BOT_TOKEN else 0
+BOT_USERNAME       = os.getenv("BOT_USERNAME", "DirectChannelLink_A1_bot")
 ADMIN_IDS          = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 RZP_KEY_ID         = os.getenv("RAZORPAY_KEY_ID", "")
 RZP_KEY_SECRET     = os.getenv("RAZORPAY_KEY_SECRET", "")
 RZP_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
-WEBHOOK_PORT       = int(os.getenv("WEBHOOK_PORT", "8000"))
+WEBHOOK_PORT       = int(os.getenv("WEBHOOK_PORT", "5000"))
 DB_PATH            = os.getenv("DATABASE_PATH", "bot_data.db")
 BROADCAST_DELAY    = float(os.getenv("BROADCAST_DELAY", "0.05"))
 MAIN_CHANNEL_ID    = os.getenv("MAIN_CHANNEL_ID", "")
@@ -355,14 +357,13 @@ async def send_mandatory_channels_prompt(
     ])
 
     text = (
-        "🛡️ <b>COMMUNITY ACCESS VERIFICATION</b> 🛡️\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "👋 Welcome! Before accessing our exclusive VIP channels, please join our official sponsor & update channels:\n\n"
-        + "\n".join(text_lines) + "\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "<blockquote><b>🛡️ COMMUNITY ACCESS VERIFICATION 🛡️</b></blockquote>\n"
+        "<blockquote>👋 Welcome! Before accessing our exclusive VIP channels, please join our official sponsor & update channels:\n\n"
+        + "\n".join(text_lines) + "\n"
+        "──────────────────────────\n"
         "📌 <b>QUICK INSTRUCTIONS:</b>\n"
         "1️⃣ Tap each channel button above to join\n"
-        "2️⃣ Return here and tap <b>'✅ Verify & Continue 🚀'</b> to unlock instant access!"
+        "2️⃣ Return here and tap <b>'✅ Verify & Continue 🚀'</b> to unlock instant access!</blockquote>"
     )
 
     markup = InlineKeyboardMarkup(keyboard_buttons)
@@ -517,20 +518,17 @@ async def send_protected_channel_link(bot, user_id: int, channel: db.sqlite3.Row
     )
 
     text = (
-        f"🎉 <b>PAYMENT CONFIRMED • ACCESS GRANTED!</b> 🎉\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏆 <b>VIP Channel:</b> <b>{channel['name']}</b>\n"
-        f"👤 <b>Subscriber ID:</b> <code>{user_id}</code>\n"
-        f"⚡ <b>Status:</b> <b>Active & Verified ✅</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📌 <b>IMPORTANT INSTRUCTIONS:</b>\n"
+        f"<blockquote><b>🎉 PAYMENT CONFIRMED • ACCESS GRANTED! 🎉</b></blockquote>\n"
+        f"<blockquote><b>🏆 VIP Channel:</b> <b>{channel['name']}</b>\n"
+        f"<b>👤 Subscriber ID:</b> <code>{user_id}</code>\n"
+        f"<b>⚡ Status:</b> <b>Active & Verified ✅</b></blockquote>\n"
+        f"<blockquote><b>📌 IMPORTANT INSTRUCTIONS:</b>\n"
         f"1️⃣ <b>Click '🚀 Join VIP Channel Now' below immediately</b>\n"
         f"2️⃣ Do not forward or share this link with anyone\n"
-        f"3️⃣ Access is securely locked to your Telegram account\n\n"
-        f"╔════════════════════════════════════╗\n"
-        f"  ⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b>\n"
-        f"╚════════════════════════════════════╝\n\n"
-        f"🏆Admin - {ADMIN_CONTACT}\n\n"
+        f"3️⃣ Access is securely locked to your Telegram account</blockquote>\n"
+        f"<blockquote>⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b>\n"
+        f"──────────────────────────\n"
+        f"🏆 Admin - {ADMIN_CONTACT}</blockquote>\n\n"
         f"{action_text}"
     )
 
@@ -612,18 +610,23 @@ async def process_successful_payment(
     # ── Notify admins (only on first approval) ────────────────────────────────
     if not already_paid:
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        isolated_tx_id = f"CLP5000-{payment_id}" if payment_id and not payment_id.startswith("CLP") else (payment_id or "N/A")
+        isolated_ref_id = f"CLP5000-{order_id}" if order_id and not order_id.startswith("CLP") else order_id
+
         admin_text = (
-            "💸 <b>New Sale! Payment Auto-Approved</b>\n\n"
+            "<blockquote><b>💸 New Sale! Payment Auto-Approved</b></blockquote>\n"
+            "<blockquote>"
             f"👤 <b>User ID:</b> <code>{user_id}</code>\n"
             f"👤 <b>Username:</b> {uname}\n"
             f"👤 <b>Name:</b> {full_name}\n"
             f"🏷️ <b>Channel:</b> <b>{channel['name'] if channel else f'Channel #{channel_id}'}</b>\n"
             f"💰 <b>Amount Paid:</b> <b>₹{amount:.0f}</b>\n"
-            f"🧾 <b>Payment Ref:</b> <code>{order_id}</code>\n"
-            f"💳 <b>Transaction ID:</b> <code>{payment_id}</code>\n"
+            f"🔒 <b>Isolated Port:</b> <code>{WEBHOOK_PORT}</code>\n"
+            f"🧾 <b>Payment Ref:</b> <code>{isolated_ref_id}</code>\n"
+            f"💳 <b>Transaction ID:</b> <code>{isolated_tx_id}</code>\n"
             f"📲 <b>Method:</b> {method or 'UPI / Auto'}\n"
-            f"⏱️ <b>Time:</b> {now_str}\n\n"
-            f"✅ <i>Access link delivered with anti-leak protection!</i>"
+            f"⏱️ <b>Time:</b> {now_str}</blockquote>\n\n"
+            f"✅ <i>Access link delivered with anti-leak protection! (Port {WEBHOOK_PORT} only)</i>"
         )
         for aid in get_admin_ids():
             try:
@@ -637,7 +640,7 @@ async def process_successful_payment(
 
 
 async def handle_razorpay_webhook(request: web.Request) -> web.Response:
-    """Process incoming Razorpay webhook events."""
+    """Process incoming Razorpay webhook events with strict bot and port isolation."""
     try:
         body = await request.read()
         sig = request.headers.get("X-Razorpay-Signature", "")
@@ -649,7 +652,7 @@ async def handle_razorpay_webhook(request: web.Request) -> web.Response:
 
         data = json.loads(body.decode("utf-8"))
         event = data.get("event", "")
-        logger.info("Razorpay webhook event received: %s", event)
+        logger.info("Razorpay webhook event received on port %d: %s", WEBHOOK_PORT, event)
 
         if event in ("order.paid", "payment.captured", "qr_code.credited"):
             payload = data.get("payload", {})
@@ -657,42 +660,89 @@ async def handle_razorpay_webhook(request: web.Request) -> web.Response:
             order_entity = payload.get("order", {}).get("entity", {})
             qr_entity = payload.get("qr_code", {}).get("entity", {})
 
-            # 1. Filter by bot tag in notes (if created by another bot sharing this Razorpay account)
-            notes = (
-                payment_entity.get("notes") or
-                order_entity.get("notes") or
-                qr_entity.get("notes") or {}
-            )
-            bot_tag = notes.get("bot") or notes.get("bot_username")
-            if bot_tag and bot_tag != "DirectChannelLink_A1_bot":
-                logger.info("Webhook for other bot '%s'. Ignored.", bot_tag)
-                return web.json_response({"status": "ignored", "reason": "different_bot"})
+            # Consolidate notes from qr_code, order, and payment entities
+            notes = {}
+            for ent in (qr_entity, order_entity, payment_entity):
+                if ent and isinstance(ent.get("notes"), dict):
+                    notes.update(ent["notes"])
 
+            # 1. Port isolation check — ignore events intended for another bot's port
+            req_port = str(notes.get("port") or notes.get("webhook_port") or "").strip()
+            if req_port and req_port != str(WEBHOOK_PORT):
+                logger.info(
+                    "Webhook port mismatch: event port is %s, this bot listens on %s. Ignored.",
+                    req_port, WEBHOOK_PORT,
+                )
+                return web.json_response({
+                    "status": "ignored",
+                    "reason": "different_port",
+                    "received_port": req_port,
+                    "bot_port": WEBHOOK_PORT,
+                })
+
+            # 2. Bot ID / Bot Number isolation check
+            req_bot_id = str(notes.get("bot_id") or notes.get("bot_number") or "").strip()
+            if req_bot_id and str(BOT_ID) and req_bot_id != str(BOT_ID):
+                logger.info(
+                    "Webhook bot_id mismatch: event bot_id is %s, this bot is %s. Ignored.",
+                    req_bot_id, BOT_ID,
+                )
+                return web.json_response({
+                    "status": "ignored",
+                    "reason": "different_bot_id",
+                    "received_bot_id": req_bot_id,
+                    "this_bot_id": str(BOT_ID),
+                })
+
+            # 3. Bot username isolation check
+            bot_tag = str(notes.get("bot") or notes.get("bot_username") or "").strip()
+            if bot_tag and BOT_USERNAME and bot_tag.lower() != BOT_USERNAME.lower():
+                logger.info(
+                    "Webhook bot_username mismatch: event bot is '%s', this bot is '%s'. Ignored.",
+                    bot_tag, BOT_USERNAME,
+                )
+                return web.json_response({
+                    "status": "ignored",
+                    "reason": "different_bot",
+                    "received_bot": bot_tag,
+                    "this_bot": BOT_USERNAME,
+                })
+
+            # 4. Reference ID extraction
             ref_id = (
                 payment_entity.get("order_id") or
                 qr_entity.get("id") or
                 order_entity.get("id") or
-                payment_entity.get("notes", {}).get("qr_id") or
-                payment_entity.get("notes", {}).get("order_id")
+                notes.get("qr_id") or
+                notes.get("order_id")
             )
             if not ref_id:
+                logger.info("Webhook event has no reference ID. Ignored.")
                 return web.json_response({"status": "ignored", "reason": "no_ref_id"})
 
-            # 2. Filter by database record (if not found in this bot's DB, it belongs to another bot)
+            # 5. Database record verification — ensures QR was generated in THIS bot's database
             payment = db.find_payment(DB_PATH, ref_id)
             if not payment:
-                logger.info("Webhook ref %s does not belong to this bot's database. Ignored.", ref_id)
-                return web.json_response({"status": "ignored", "reason": "not_in_db"})
+                logger.info(
+                    "Webhook ref %s does not exist in this bot's database (%s). Ignored.",
+                    ref_id, DB_PATH,
+                )
+                return web.json_response({
+                    "status": "ignored",
+                    "reason": "not_in_db",
+                    "ref_id": ref_id,
+                })
 
             payment_id = payment_entity.get("id") or ""
             amount_paise = payment_entity.get("amount") or order_entity.get("amount") or qr_entity.get("payment_amount") or 0
             amount_inr = (amount_paise / 100.0) if amount_paise else None
             method = payment_entity.get("method", "UPI QR Webhook")
 
+            logger.info("Processing verified payment for this bot: ref_id=%s, payment_id=%s, amount=₹%s", ref_id, payment_id, amount_inr)
             bot = request.app["bot"]
             await process_successful_payment(bot, ref_id, payment_id, amount_inr, method)
 
-        return web.json_response({"status": "ok"})
+        return web.json_response({"status": "ok", "bot_id": str(BOT_ID), "port": WEBHOOK_PORT})
     except Exception as exc:
         logger.error("Razorpay webhook error: %s", exc)
         return web.Response(status=500, text=str(exc))
@@ -702,7 +752,10 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({
         "status": "online",
         "service": "Razorpay Auto-Approval Webhook",
-        "bot": "DirectChannelLink_A1_bot"
+        "bot_id": BOT_ID,
+        "bot_number": str(BOT_ID),
+        "bot_username": BOT_USERNAME,
+        "port": WEBHOOK_PORT,
     })
 
 
@@ -710,8 +763,12 @@ async def start_webhook_server(bot) -> web.AppRunner:
     """Start local aiohttp webhook server."""
     web_app = web.Application()
     web_app["bot"] = bot
+    web_app.router.add_post("/razorpay-webhook", handle_razorpay_webhook)
+    web_app.router.add_post("/razorpay_webhook", handle_razorpay_webhook)
     web_app.router.add_post("/webhook/razorpay", handle_razorpay_webhook)
     web_app.router.add_post("/webhook", handle_razorpay_webhook)
+    web_app.router.add_get("/razorpay-webhook", handle_health)
+    web_app.router.add_get("/razorpay_webhook", handle_health)
     web_app.router.add_get("/", handle_health)
     web_app.router.add_get("/health", handle_health)
 
@@ -719,7 +776,7 @@ async def start_webhook_server(bot) -> web.AppRunner:
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
     await site.start()
-    logger.info("Razorpay Webhook server running on http://0.0.0.0:%d/webhook/razorpay", WEBHOOK_PORT)
+    logger.info("Razorpay Webhook server running on http://0.0.0.0:%d/razorpay-webhook", WEBHOOK_PORT)
     return runner
 
 
@@ -1199,7 +1256,12 @@ def _blocking_get_or_create_qr(
     notes = {
         "user_id": str(user_id),
         "channel_id": str(channel_id),
-        "bot": "DirectChannelLink_A1_bot",
+        "bot": BOT_USERNAME,
+        "bot_username": BOT_USERNAME,
+        "bot_id": str(BOT_ID),
+        "bot_number": str(BOT_ID),
+        "port": str(WEBHOOK_PORT),
+        "webhook_port": str(WEBHOOK_PORT),
     }
     if post_id:
         notes["post_id"] = str(post_id)
@@ -1250,23 +1312,20 @@ async def get_or_create_qr_code(
 def build_qr_payment_caption(channel_name: str, price: float, qr_id: str) -> str:
     """Rich, engaging payment QR caption with clear instructions and advanced emojis."""
     return (
-        f"👑 <b>PREMIUM VIP ACCESS PAYMENT</b> 👑\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏷️ <b>Channel:</b> <b>{channel_name}</b>\n"
-        f"💵 <b>Pay Amount:</b> <b>₹{price:.0f}</b> <i>(One-Time Fee)</i>\n"
-        f"🧾 <b>Payment Ref ID:</b> <code>{qr_id}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📲 <b>HOW TO PAY (FAST & EASY):</b>\n"
+        f"<blockquote><b>👑 PREMIUM VIP ACCESS PAYMENT 👑</b></blockquote>\n"
+        f"<blockquote><b>🏷️ Channel:</b> <b>{channel_name}</b>\n"
+        f"<b>💵 Pay Amount:</b> <b>₹{price:.0f}</b> <i>(One-Time Fee)</i>\n"
+        f"<b>🧾 Payment Ref ID:</b> <code>{qr_id}</code></blockquote>\n"
+        f"<blockquote><b>📲 HOW TO PAY (FAST & EASY):</b>\n"
         f"1️⃣ <b>Scan the QR Code</b> above with any UPI app\n"
         f"   └ <i>GPay • PhonePe • Paytm • BHIM • CRED</i>\n"
         f"2️⃣ Complete the payment of <b>₹{price:.0f}</b>\n"
         f"3️⃣ <b>Wait 3–5 seconds</b> — payment is auto-detected!\n"
-        f"   └ <i>Your VIP link will be delivered right here instantly! 🚀</i>\n\n"
-        f"╔════════════════════════════════════╗\n"
-        f"  ⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b>\n"
-        f"╚════════════════════════════════════╝\n\n"
-        f"🏆Admin - {ADMIN_CONTACT}\n"
-        f"💬 <b>Need help?</b> Share your Ref ID (<code>{qr_id}</code>) with Admin."
+        f"   └ <i>Your VIP link will be delivered right here instantly! 🚀</i></blockquote>\n"
+        f"<blockquote>⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b>\n"
+        f"──────────────────────────\n"
+        f"🏆 Admin - {ADMIN_CONTACT}\n"
+        f"💬 <b>Need help?</b> Share your Ref ID (<code>{qr_id}</code>) with Admin.</blockquote>"
     )
 
 
@@ -1298,8 +1357,8 @@ async def handle_start_buy_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
     if already:
         await reply_or_send_text(
             update, ctx,
-            f"✅ <b>You already have active access to {channel['name']}!</b>\n\n"
-            "Tap below to receive your protected access link:",
+            f"<blockquote><b>✅ You already have active access to {channel['name']}!</b></blockquote>\n\n"
+            "👇 <b>Tap below to receive your protected access link:</b>",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔗 Get Protected Access Link", callback_data=f"getlink:{channel_id}")
             ]]),
@@ -1309,16 +1368,6 @@ async def handle_start_buy_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
     # Check for free channel access — zero payment, direct link
     if price <= 0:
         db.grant_free_access(DB_PATH, user.id, channel_id)
-        await reply_or_send_text(
-            update, ctx,
-            f"🎉 <b>FREE ACCESS GRANTED!</b> 🎉\n\n"
-            f"🏆 <b>VIP Channel:</b> <b>{channel['name']}</b>\n"
-            f"👤 <b>Subscriber:</b> <code>{user.id}</code>\n"
-            f"💰 <b>Access Fee:</b> <b>FREE (₹0) 🎁</b>\n"
-            f"🏆Admin - {ADMIN_CONTACT}\n\n"
-            f"Your private access link has been generated below with zero fee:",
-            parse_mode=ParseMode.HTML,
-        )
         await send_protected_channel_link(ctx.bot, user.id, channel)
         return
 
@@ -1401,8 +1450,8 @@ async def handle_start_buy_channel(update: Update, ctx: ContextTypes.DEFAULT_TYP
     if already:
         await reply_or_send_text(
             update, ctx,
-            f"✅ <b>You already have active access to {channel['name']}!</b>\n\n"
-            "Tap below to receive your protected access link:",
+            f"<blockquote><b>✅ You already have active access to {channel['name']}!</b></blockquote>\n\n"
+            "👇 <b>Tap below to receive your protected access link:</b>",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔗 Get Protected Access Link", callback_data=f"getlink:{channel_id}")
             ]]),
@@ -1412,16 +1461,6 @@ async def handle_start_buy_channel(update: Update, ctx: ContextTypes.DEFAULT_TYP
     # Check for free channel access — zero payment, direct link
     if price <= 0:
         db.grant_free_access(DB_PATH, user.id, channel_id)
-        await reply_or_send_text(
-            update, ctx,
-            f"🎉 <b>FREE ACCESS GRANTED!</b> 🎉\n\n"
-            f"🏆 <b>VIP Channel:</b> <b>{channel['name']}</b>\n"
-            f"👤 <b>Subscriber:</b> <code>{user.id}</code>\n"
-            f"💰 <b>Access Fee:</b> <b>FREE (₹0) 🎁</b>\n"
-            f"🏆Admin - {ADMIN_CONTACT}\n\n"
-            f"Your private access link has been generated below with zero fee:",
-            parse_mode=ParseMode.HTML,
-        )
         await send_protected_channel_link(ctx.bot, user.id, channel)
         return
 
@@ -1514,24 +1553,20 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 pass
 
     welcome = (
-        f"🌟 <b>Welcome, {user.first_name}!</b> 🌟\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💎 <b>VIP CHANNEL ACCESS PORTAL</b> 💎\n\n"
-        f"🚀 <i>Get instant, lifetime, protected access to top exclusive VIP Telegram channels.</i>\n\n"
-        f"📖 <b>HOW IT WORKS (3 SIMPLE STEPS):</b>\n"
+        f"<blockquote><b>🌟 Welcome, {user.first_name}! 🌟</b></blockquote>\n"
+        f"<blockquote><b>💎 VIP CHANNEL ACCESS PORTAL 💎</b>\n"
+        f"🚀 <i>Get instant, lifetime, protected access to top exclusive VIP Telegram channels.</i></blockquote>\n"
+        f"<blockquote><b>📖 HOW IT WORKS (3 SIMPLE STEPS):</b>\n"
         f"1️⃣ <b>Browse Channels:</b> Type /menu to view all available VIP channels & pricing.\n"
         f"2️⃣ <b>Fast UPI Payment:</b> Scan the generated QR code with any UPI app (GPay/PhonePe/Paytm).\n"
-        f"3️⃣ <b>Instant Delivery:</b> System automatically detects payment within seconds and sends your private invite link!\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📌 <b>QUICK SHORTCUTS:</b>\n"
+        f"3️⃣ <b>Instant Delivery:</b> System automatically detects payment within seconds and sends your private invite link!</blockquote>\n"
+        f"<blockquote><b>📌 QUICK SHORTCUTS:</b>\n"
         f"🛍️ /menu — Browse all channels & pricing\n"
         f"🛒 /mypurchases — Access your bought channels\n"
-        f"ℹ️ /help — How to buy & FAQ guide\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"╔════════════════════════════════════╗\n"
-        f"  ⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b>\n"
-        f"╚════════════════════════════════════╝\n\n"
-        f"🏆Admin - {ADMIN_CONTACT}"
+        f"ℹ️ /help — How to buy & FAQ guide</blockquote>\n"
+        f"<blockquote>⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b>\n"
+        f"──────────────────────────\n"
+        f"🏆 Admin - {ADMIN_CONTACT}</blockquote>"
     )
     welcome_kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🛍️ Browse VIP Channels", callback_data="back_menu")],
@@ -1557,11 +1592,11 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     text = (
-        "👑 <b>EXCLUSIVE VIP CHANNELS DIRECTORY</b> 👑\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "✨ Select any VIP channel below to view full details, perks & unlock instant access:\n\n"
-        f"⚡ <i>Instant automated UPI payment • Protected 1-click delivery</i>\n\n"
-        f"🏆Admin - {ADMIN_CONTACT}"
+        "<blockquote><b>👑 EXCLUSIVE VIP CHANNELS DIRECTORY 👑</b></blockquote>\n"
+        "<blockquote>✨ Select any VIP channel below to view full details, perks & unlock instant access:\n\n"
+        "⚡ <i>Instant automated UPI payment • Protected 1-click delivery</i>\n"
+        "──────────────────────────\n"
+        f"🏆 Admin - {ADMIN_CONTACT}</blockquote>"
     )
     await reply_or_send_text(
         update, ctx,
@@ -1595,10 +1630,9 @@ async def cmd_mypurchases(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     text = (
-        "👑 <b>YOUR PURCHASED VIP CHANNELS</b> 👑\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "✨ Tap on any channel below to retrieve your private, protected access link:\n\n"
-        "🔒 <i>Links are bound to your account and protected against sharing.</i>"
+        "<blockquote><b>👑 YOUR PURCHASED VIP CHANNELS 👑</b></blockquote>\n"
+        "<blockquote>✨ Tap on any channel below to retrieve your private, protected access link:\n\n"
+        "🔒 <i>Links are bound to your account and protected against sharing.</i></blockquote>"
     )
     buttons = [
         [InlineKeyboardButton(f"✨ {p['name']} 🔓", callback_data=f"getlink:{p['id']}")]
@@ -1619,34 +1653,30 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     admin_status = is_admin(uid)
 
     guide = (
-        "📖 <b>BOT INSTRUCTIONS & USER GUIDE</b> 📖\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Welcome to the automated <b>Channel Link Provider</b>! Here is your complete guide:\n\n"
+        "<blockquote><b>📖 BOT INSTRUCTIONS & USER GUIDE 📖</b></blockquote>\n"
+        "<blockquote>Welcome to the automated <b>Channel Link Provider</b>! Here is your complete guide:\n\n"
         "🛍️ <b>HOW TO PURCHASE VIP ACCESS:</b>\n"
         "1️⃣ <b>Browse:</b> Open /menu or tap the buy button on any channel post.\n"
         "2️⃣ <b>QR Code:</b> The bot generates an instant, cropped UPI QR code for the exact price.\n"
         "3️⃣ <b>Scan with Any UPI App:</b> Open PhonePe, Google Pay, Paytm, BHIM, or CRED.\n"
         "4️⃣ <b>Instant Auto-Delivery:</b> Payment is auto-detected within 3–5 seconds and your private invite link is delivered instantly!\n"
-        "5️⃣ <b>Join Promptly:</b> Tap '🚀 Join VIP Channel Now' to enter.\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔒 <b>ACCESS & SECURITY:</b>\n"
+        "5️⃣ <b>Join Promptly:</b> Tap '🚀 Join VIP Channel Now' to enter.</blockquote>\n"
+        "<blockquote>🔒 <b>ACCESS & SECURITY:</b>\n"
         "• <b>One-Time Access:</b> Invite links are personal and bound to your Telegram account.\n"
         "• <b>Anti-Leak Protection:</b> Forwarded links cannot be used by others.\n"
-        "• <b>Active Purchases:</b> Use /mypurchases anytime to retrieve your active purchased links.\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📌 <b>AVAILABLE USER COMMANDS:</b>\n"
+        "• <b>Active Purchases:</b> Use /mypurchases anytime to retrieve your active purchased links.</blockquote>\n"
+        "<blockquote>📌 <b>AVAILABLE USER COMMANDS:</b>\n"
         "• /start — Welcome portal & quick actions\n"
         "• /menu — Browse VIP channels & pricing\n"
         "• /mypurchases — View your active channel links\n"
-        "• /help — Show this instructions guide\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏆Admin - {ADMIN_CONTACT}"
+        "• /help — Show this instructions guide\n"
+        "──────────────────────────\n"
+        f"🏆 Admin - {ADMIN_CONTACT}</blockquote>"
     )
 
     if admin_status:
         admin_section = (
-            "\n\n━━━━━━━━━━━━━━━━━━━━━━\n"
-            "👑 <b>ADMIN COMMANDS & SHORTCUTS:</b>\n"
+            "\n<blockquote>👑 <b>ADMIN COMMANDS & SHORTCUTS:</b>\n"
             "• /post — Create & broadcast promotional post to main channel\n"
             "• /posts — View recent broadcast posts\n"
             "• /setmainchannel — Set default channel for posts\n"
@@ -1661,7 +1691,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "• /check &lt;id&gt; — Inspect payment or QR ID live\n"
             "• /grantaccess — Grant free access to user\n"
             "• /broadcast — Send message to all bot users\n"
-            "• /ban / /unban — Manage user blacklist"
+            "• /ban / /unban — Manage user blacklist</blockquote>"
         )
         guide += admin_section
 
@@ -1711,21 +1741,18 @@ async def cb_view_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         action_btn = InlineKeyboardButton(f"💳 Pay ₹{channel['price_inr']:.0f} via UPI QR 🚀", callback_data=f"buy:{channel_id}")
 
     text = (
-        f"👑 <b>{channel['name']}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📖 <b>Description & Perks:</b>\n"
+        f"<blockquote><b>👑 {channel['name']}</b></blockquote>\n"
+        f"<blockquote>📖 <b>Description & Perks:</b>\n"
         f"<i>{desc}</i>\n\n"
         f"💎 <b>Key Highlights:</b>\n"
         f"• 🚀 <i>Instant 1-Click Access</i>\n"
         f"• 🔒 <i>Private, Verified & Safe Content</i>\n"
-        f"• ⚡ <i>Zero Waiting Time • Auto-Processed</i>\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{status_line}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"╔════════════════════════════════════╗\n"
-        f"  ⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b>\n"
-        f"╚════════════════════════════════════╝\n\n"
-        f"🏆Admin - {ADMIN_CONTACT}"
+        f"• ⚡ <i>Zero Waiting Time • Auto-Processed</i>\n"
+        f"──────────────────────────\n"
+        f"{status_line}</blockquote>\n"
+        f"<blockquote>⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b>\n"
+        f"──────────────────────────\n"
+        f"🏆 Admin - {ADMIN_CONTACT}</blockquote>"
     )
 
     keyboard = InlineKeyboardMarkup([
@@ -2306,19 +2333,18 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     text = (
-        "📊 <b>Bot Statistics</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "<blockquote><b>📊 Bot Statistics</b></blockquote>\n"
+        "<blockquote>"
         f"👥 Total Users:      <b>{stats['total_users']}</b>\n"
         f"✅ Active Users:     <b>{stats['active_users']}</b>\n"
         f"📌 Total Channels:   <b>{stats['total_channels']}</b>\n"
-        f"🟢 Active Channels:  <b>{stats['active_channels']}</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 Active Channels:  <b>{stats['active_channels']}</b></blockquote>\n"
+        "<blockquote>"
         f"💰 Total Revenue:    <b>₹{stats['total_revenue']:.2f}</b>\n"
         f"✅ Paid Txns:        <b>{stats['total_paid_txns']}</b>\n"
-        f"⏳ Pending Payments: <b>{stats['pending_payments']}</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>Per Channel Revenue:</b>"
-        f"{ch_lines or '  None yet'}"
+        f"⏳ Pending Payments: <b>{stats['pending_payments']}</b></blockquote>\n"
+        "<blockquote><b>Per Channel Revenue:</b>"
+        f"{ch_lines or '  None yet'}</blockquote>"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -2656,6 +2682,8 @@ async def post_get_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     """Receive photo or handle skip for broadcast post, then immediately prompt for channel."""
     if update.message.photo:
         ctx.user_data["post_photo"] = update.message.photo[-1].file_id
+        if update.message.caption:
+            ctx.user_data["post_text"] = update.message.caption_html or update.message.caption
     elif update.message.text and update.message.text.strip().lower() in ("skip", "/skip"):
         ctx.user_data["post_photo"] = None
     elif update.message.text:
@@ -2995,15 +3023,14 @@ async def render_post_preview(message, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
     if is_free:
         if custom_text:
-            header_text = f"{custom_text}\n\n"
-        else:
-            header_text = (
-                f"🎁 <b>EXCLUSIVE FREE VIP CHANNEL ACCESS</b> 🎁\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🌟 <b>Channel:</b> <b>{ch_name}</b>\n"
+            header_block = (
+                f"<blockquote><b>🎁 EXCLUSIVE FREE VIP CHANNEL ACCESS 🎁</b></blockquote>\n"
+                f"<blockquote>{custom_text}</blockquote>\n"
             )
+        else:
+            header_block = f"<blockquote><b>🎁 EXCLUSIVE FREE VIP CHANNEL ACCESS 🎁</b></blockquote>\n"
         price_line = "💰 <b>Access Fee:</b> <b>FREE (₹0) 🎁</b>\n"
-        payment_mode_line = "⚡ <b>Instant Access:</b> Zero Payment • 100% Free Join\n"
+        payment_mode_line = "⚡ <b>Instant Access:</b> Zero Payment • 100% Free Join"
         action_line = "👇 <b>Tap the button below to join for free:</b>"
 
         btn_url = channel["link"] if link_mode == "direct" else f"https://t.me/{bot_me.username}?start=free_{channel['id']}"
@@ -3013,20 +3040,19 @@ async def render_post_preview(message, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         ])
     else:
         if custom_text:
-            header_text = f"{custom_text}\n\n"
-        else:
-            header_text = (
-                f"🔥 <b>EXCLUSIVE VIP CHANNEL ACCESS</b> 🔥\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🌟 <b>Channel:</b> <b>{ch_name}</b>\n"
+            header_block = (
+                f"<blockquote><b>🔥 EXCLUSIVE VIP CHANNEL ACCESS 🔥</b></blockquote>\n"
+                f"<blockquote>{custom_text}</blockquote>\n"
             )
+        else:
+            header_block = f"<blockquote><b>🔥 EXCLUSIVE VIP CHANNEL ACCESS 🔥</b></blockquote>\n"
 
         cross_price = ctx.user_data.get("post_cross_price")
         if cross_price and cross_price > 0:
             price_line = f"💰 <b>Access Fee:</b> <b>₹{price:.0f}</b> <s>₹{cross_price:.0f}</s> <i>(Limited Time Offer)</i>\n"
         else:
             price_line = f"💰 <b>Access Fee:</b> <b>₹{price:.0f}</b> <i>(Limited Time Offer)</i>\n"
-        payment_mode_line = "📲 <b>Payment Mode:</b> Any UPI App (PhonePe, GPay, Paytm, BHIM)\n"
+        payment_mode_line = "📲 <b>Payment Mode:</b> Any UPI App (PhonePe, GPay, Paytm, BHIM)"
         action_line = "👇 <b>Tap the button below to unlock instant VIP access:</b>"
 
         preview_kb = InlineKeyboardMarkup([
@@ -3034,14 +3060,12 @@ async def render_post_preview(message, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         ])
 
     preview_caption = (
-        f"{header_text}"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{header_block}"
+        f"<blockquote><b>🌟 Channel:</b> <b>{ch_name}</b>\n"
+        f"──────────────────────────\n"
         f"{price_line}"
-        f"{payment_mode_line}"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"╔════════════════════════════════════╗\n"
-        f"  ⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b>\n"
-        f"╚════════════════════════════════════╝\n\n"
+        f"{payment_mode_line}</blockquote>\n"
+        f"<blockquote>⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b></blockquote>\n\n"
         f"{action_line}"
     )
     if photo_file_id and len(preview_caption) > 1024:
@@ -3398,6 +3422,15 @@ async def handle_chat_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYP
 
 async def post_init(app: Application) -> None:
     """Start Webhook server, background poller, and set bot commands."""
+    global BOT_ID, BOT_USERNAME
+    try:
+        me = await app.bot.get_me()
+        BOT_ID = me.id
+        BOT_USERNAME = me.username or BOT_USERNAME
+        logger.info("Bot authenticated: @%s (Bot ID: %s, Webhook Port: %d)", BOT_USERNAME, BOT_ID, WEBHOOK_PORT)
+    except Exception as exc:
+        logger.warning("Could not refresh bot profile in post_init: %s", exc)
+
     # 1. Start Webhook server for Razorpay
     try:
         runner = await start_webhook_server(app.bot)
