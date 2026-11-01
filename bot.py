@@ -355,14 +355,13 @@ async def send_mandatory_channels_prompt(
     ])
 
     text = (
-        "🛡️ <b>COMMUNITY ACCESS VERIFICATION</b> 🛡️\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "👋 Welcome! Before accessing our exclusive VIP channels, please join our official sponsor & update channels:\n\n"
-        + "\n".join(text_lines) + "\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "<blockquote><b>🛡️ COMMUNITY ACCESS VERIFICATION 🛡️</b></blockquote>\n"
+        "<blockquote>👋 Welcome! Before accessing our exclusive VIP channels, please join our official sponsor & update channels:\n\n"
+        + "\n".join(text_lines) + "\n"
+        "──────────────────────────\n"
         "📌 <b>QUICK INSTRUCTIONS:</b>\n"
         "1️⃣ Tap each channel button above to join\n"
-        "2️⃣ Return here and tap <b>'✅ Verify & Continue 🚀'</b> to unlock instant access!"
+        "2️⃣ Return here and tap <b>'✅ Verify & Continue 🚀'</b> to unlock instant access!</blockquote>"
     )
 
     markup = InlineKeyboardMarkup(keyboard_buttons)
@@ -1292,8 +1291,8 @@ async def handle_start_buy_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
     if already:
         await reply_or_send_text(
             update, ctx,
-            f"✅ <b>You already have active access to {channel['name']}!</b>\n\n"
-            "Tap below to receive your protected access link:",
+            f"<blockquote><b>✅ You already have active access to {channel['name']}!</b></blockquote>\n\n"
+            "👇 <b>Tap below to receive your protected access link:</b>",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔗 Get Protected Access Link", callback_data=f"getlink:{channel_id}")
             ]]),
@@ -1303,17 +1302,6 @@ async def handle_start_buy_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
     # Check for free channel access — zero payment, direct link
     if price <= 0:
         db.grant_free_access(DB_PATH, user.id, channel_id)
-        await reply_or_send_text(
-            update, ctx,
-            f"<blockquote><b>🎉 FREE ACCESS GRANTED! 🎉</b></blockquote>\n"
-            f"<blockquote><b>🏆 VIP Channel:</b> <b>{channel['name']}</b>\n"
-            f"<b>👤 Subscriber:</b> <code>{user.id}</code>\n"
-            f"<b>💰 Access Fee:</b> <b>FREE (₹0) 🎁</b>\n"
-            f"──────────────────────────\n"
-            f"🏆 Admin - {ADMIN_CONTACT}</blockquote>\n\n"
-            f"👇 <b>Your private access link has been generated below with zero fee:</b>",
-            parse_mode=ParseMode.HTML,
-        )
         await send_protected_channel_link(ctx.bot, user.id, channel)
         return
 
@@ -1396,8 +1384,8 @@ async def handle_start_buy_channel(update: Update, ctx: ContextTypes.DEFAULT_TYP
     if already:
         await reply_or_send_text(
             update, ctx,
-            f"✅ <b>You already have active access to {channel['name']}!</b>\n\n"
-            "Tap below to receive your protected access link:",
+            f"<blockquote><b>✅ You already have active access to {channel['name']}!</b></blockquote>\n\n"
+            "👇 <b>Tap below to receive your protected access link:</b>",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔗 Get Protected Access Link", callback_data=f"getlink:{channel_id}")
             ]]),
@@ -1407,17 +1395,6 @@ async def handle_start_buy_channel(update: Update, ctx: ContextTypes.DEFAULT_TYP
     # Check for free channel access — zero payment, direct link
     if price <= 0:
         db.grant_free_access(DB_PATH, user.id, channel_id)
-        await reply_or_send_text(
-            update, ctx,
-            f"<blockquote><b>🎉 FREE ACCESS GRANTED! 🎉</b></blockquote>\n"
-            f"<blockquote><b>🏆 VIP Channel:</b> <b>{channel['name']}</b>\n"
-            f"<b>👤 Subscriber:</b> <code>{user.id}</code>\n"
-            f"<b>💰 Access Fee:</b> <b>FREE (₹0) 🎁</b>\n"
-            f"──────────────────────────\n"
-            f"🏆 Admin - {ADMIN_CONTACT}</blockquote>\n\n"
-            f"👇 <b>Your private access link has been generated below with zero fee:</b>",
-            parse_mode=ParseMode.HTML,
-        )
         await send_protected_channel_link(ctx.bot, user.id, channel)
         return
 
@@ -1510,24 +1487,20 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 pass
 
     welcome = (
-        f"🌟 <b>Welcome, {user.first_name}!</b> 🌟\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💎 <b>VIP CHANNEL ACCESS PORTAL</b> 💎\n\n"
-        f"🚀 <i>Get instant, lifetime, protected access to top exclusive VIP Telegram channels.</i>\n\n"
-        f"📖 <b>HOW IT WORKS (3 SIMPLE STEPS):</b>\n"
+        f"<blockquote><b>🌟 Welcome, {user.first_name}! 🌟</b></blockquote>\n"
+        f"<blockquote><b>💎 VIP CHANNEL ACCESS PORTAL 💎</b>\n"
+        f"🚀 <i>Get instant, lifetime, protected access to top exclusive VIP Telegram channels.</i></blockquote>\n"
+        f"<blockquote><b>📖 HOW IT WORKS (3 SIMPLE STEPS):</b>\n"
         f"1️⃣ <b>Browse Channels:</b> Type /menu to view all available VIP channels & pricing.\n"
         f"2️⃣ <b>Fast UPI Payment:</b> Scan the generated QR code with any UPI app (GPay/PhonePe/Paytm).\n"
-        f"3️⃣ <b>Instant Delivery:</b> System automatically detects payment within seconds and sends your private invite link!\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📌 <b>QUICK SHORTCUTS:</b>\n"
+        f"3️⃣ <b>Instant Delivery:</b> System automatically detects payment within seconds and sends your private invite link!</blockquote>\n"
+        f"<blockquote><b>📌 QUICK SHORTCUTS:</b>\n"
         f"🛍️ /menu — Browse all channels & pricing\n"
         f"🛒 /mypurchases — Access your bought channels\n"
-        f"ℹ️ /help — How to buy & FAQ guide\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"╔════════════════════════════════════╗\n"
-        f"  ⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b>\n"
-        f"╚════════════════════════════════════╝\n\n"
-        f"🏆Admin - {ADMIN_CONTACT}"
+        f"ℹ️ /help — How to buy & FAQ guide</blockquote>\n"
+        f"<blockquote>⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b>\n"
+        f"──────────────────────────\n"
+        f"🏆 Admin - {ADMIN_CONTACT}</blockquote>"
     )
     welcome_kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🛍️ Browse VIP Channels", callback_data="back_menu")],
@@ -1553,11 +1526,11 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     text = (
-        "👑 <b>EXCLUSIVE VIP CHANNELS DIRECTORY</b> 👑\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "✨ Select any VIP channel below to view full details, perks & unlock instant access:\n\n"
-        f"⚡ <i>Instant automated UPI payment • Protected 1-click delivery</i>\n\n"
-        f"🏆Admin - {ADMIN_CONTACT}"
+        "<blockquote><b>👑 EXCLUSIVE VIP CHANNELS DIRECTORY 👑</b></blockquote>\n"
+        "<blockquote>✨ Select any VIP channel below to view full details, perks & unlock instant access:\n\n"
+        "⚡ <i>Instant automated UPI payment • Protected 1-click delivery</i>\n"
+        "──────────────────────────\n"
+        f"🏆 Admin - {ADMIN_CONTACT}</blockquote>"
     )
     await reply_or_send_text(
         update, ctx,
@@ -1591,10 +1564,9 @@ async def cmd_mypurchases(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     text = (
-        "👑 <b>YOUR PURCHASED VIP CHANNELS</b> 👑\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "✨ Tap on any channel below to retrieve your private, protected access link:\n\n"
-        "🔒 <i>Links are bound to your account and protected against sharing.</i>"
+        "<blockquote><b>👑 YOUR PURCHASED VIP CHANNELS 👑</b></blockquote>\n"
+        "<blockquote>✨ Tap on any channel below to retrieve your private, protected access link:\n\n"
+        "🔒 <i>Links are bound to your account and protected against sharing.</i></blockquote>"
     )
     buttons = [
         [InlineKeyboardButton(f"✨ {p['name']} 🔓", callback_data=f"getlink:{p['id']}")]
@@ -1615,34 +1587,30 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     admin_status = is_admin(uid)
 
     guide = (
-        "📖 <b>BOT INSTRUCTIONS & USER GUIDE</b> 📖\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Welcome to the automated <b>Channel Link Provider</b>! Here is your complete guide:\n\n"
+        "<blockquote><b>📖 BOT INSTRUCTIONS & USER GUIDE 📖</b></blockquote>\n"
+        "<blockquote>Welcome to the automated <b>Channel Link Provider</b>! Here is your complete guide:\n\n"
         "🛍️ <b>HOW TO PURCHASE VIP ACCESS:</b>\n"
         "1️⃣ <b>Browse:</b> Open /menu or tap the buy button on any channel post.\n"
         "2️⃣ <b>QR Code:</b> The bot generates an instant, cropped UPI QR code for the exact price.\n"
         "3️⃣ <b>Scan with Any UPI App:</b> Open PhonePe, Google Pay, Paytm, BHIM, or CRED.\n"
         "4️⃣ <b>Instant Auto-Delivery:</b> Payment is auto-detected within 3–5 seconds and your private invite link is delivered instantly!\n"
-        "5️⃣ <b>Join Promptly:</b> Tap '🚀 Join VIP Channel Now' to enter.\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔒 <b>ACCESS & SECURITY:</b>\n"
+        "5️⃣ <b>Join Promptly:</b> Tap '🚀 Join VIP Channel Now' to enter.</blockquote>\n"
+        "<blockquote>🔒 <b>ACCESS & SECURITY:</b>\n"
         "• <b>One-Time Access:</b> Invite links are personal and bound to your Telegram account.\n"
         "• <b>Anti-Leak Protection:</b> Forwarded links cannot be used by others.\n"
-        "• <b>Active Purchases:</b> Use /mypurchases anytime to retrieve your active purchased links.\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📌 <b>AVAILABLE USER COMMANDS:</b>\n"
+        "• <b>Active Purchases:</b> Use /mypurchases anytime to retrieve your active purchased links.</blockquote>\n"
+        "<blockquote>📌 <b>AVAILABLE USER COMMANDS:</b>\n"
         "• /start — Welcome portal & quick actions\n"
         "• /menu — Browse VIP channels & pricing\n"
         "• /mypurchases — View your active channel links\n"
-        "• /help — Show this instructions guide\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏆Admin - {ADMIN_CONTACT}"
+        "• /help — Show this instructions guide\n"
+        "──────────────────────────\n"
+        f"🏆 Admin - {ADMIN_CONTACT}</blockquote>"
     )
 
     if admin_status:
         admin_section = (
-            "\n\n━━━━━━━━━━━━━━━━━━━━━━\n"
-            "👑 <b>ADMIN COMMANDS & SHORTCUTS:</b>\n"
+            "\n<blockquote>👑 <b>ADMIN COMMANDS & SHORTCUTS:</b>\n"
             "• /post — Create & broadcast promotional post to main channel\n"
             "• /posts — View recent broadcast posts\n"
             "• /setmainchannel — Set default channel for posts\n"
@@ -1657,7 +1625,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "• /check &lt;id&gt; — Inspect payment or QR ID live\n"
             "• /grantaccess — Grant free access to user\n"
             "• /broadcast — Send message to all bot users\n"
-            "• /ban / /unban — Manage user blacklist"
+            "• /ban / /unban — Manage user blacklist</blockquote>"
         )
         guide += admin_section
 
@@ -2299,19 +2267,18 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     text = (
-        "📊 <b>Bot Statistics</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "<blockquote><b>📊 Bot Statistics</b></blockquote>\n"
+        "<blockquote>"
         f"👥 Total Users:      <b>{stats['total_users']}</b>\n"
         f"✅ Active Users:     <b>{stats['active_users']}</b>\n"
         f"📌 Total Channels:   <b>{stats['total_channels']}</b>\n"
-        f"🟢 Active Channels:  <b>{stats['active_channels']}</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 Active Channels:  <b>{stats['active_channels']}</b></blockquote>\n"
+        "<blockquote>"
         f"💰 Total Revenue:    <b>₹{stats['total_revenue']:.2f}</b>\n"
         f"✅ Paid Txns:        <b>{stats['total_paid_txns']}</b>\n"
-        f"⏳ Pending Payments: <b>{stats['pending_payments']}</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>Per Channel Revenue:</b>"
-        f"{ch_lines or '  None yet'}"
+        f"⏳ Pending Payments: <b>{stats['pending_payments']}</b></blockquote>\n"
+        "<blockquote><b>Per Channel Revenue:</b>"
+        f"{ch_lines or '  None yet'}</blockquote>"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -2649,6 +2616,8 @@ async def post_get_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     """Receive photo or handle skip for broadcast post, then immediately prompt for channel."""
     if update.message.photo:
         ctx.user_data["post_photo"] = update.message.photo[-1].file_id
+        if update.message.caption:
+            ctx.user_data["post_text"] = update.message.caption_html or update.message.caption
     elif update.message.text and update.message.text.strip().lower() in ("skip", "/skip"):
         ctx.user_data["post_photo"] = None
     elif update.message.text:
@@ -2988,7 +2957,10 @@ async def render_post_preview(message, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
     if is_free:
         if custom_text:
-            header_block = f"<blockquote>{custom_text}</blockquote>\n"
+            header_block = (
+                f"<blockquote><b>🎁 EXCLUSIVE FREE VIP CHANNEL ACCESS 🎁</b></blockquote>\n"
+                f"<blockquote>{custom_text}</blockquote>\n"
+            )
         else:
             header_block = f"<blockquote><b>🎁 EXCLUSIVE FREE VIP CHANNEL ACCESS 🎁</b></blockquote>\n"
         price_line = "💰 <b>Access Fee:</b> <b>FREE (₹0) 🎁</b>\n"
@@ -3002,7 +2974,10 @@ async def render_post_preview(message, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         ])
     else:
         if custom_text:
-            header_block = f"<blockquote>{custom_text}</blockquote>\n"
+            header_block = (
+                f"<blockquote><b>🔥 EXCLUSIVE VIP CHANNEL ACCESS 🔥</b></blockquote>\n"
+                f"<blockquote>{custom_text}</blockquote>\n"
+            )
         else:
             header_block = f"<blockquote><b>🔥 EXCLUSIVE VIP CHANNEL ACCESS 🔥</b></blockquote>\n"
 
