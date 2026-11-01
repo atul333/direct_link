@@ -517,20 +517,17 @@ async def send_protected_channel_link(bot, user_id: int, channel: db.sqlite3.Row
     )
 
     text = (
-        f"🎉 <b>PAYMENT CONFIRMED • ACCESS GRANTED!</b> 🎉\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏆 <b>VIP Channel:</b> <b>{channel['name']}</b>\n"
-        f"👤 <b>Subscriber ID:</b> <code>{user_id}</code>\n"
-        f"⚡ <b>Status:</b> <b>Active & Verified ✅</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📌 <b>IMPORTANT INSTRUCTIONS:</b>\n"
+        f"<blockquote><b>🎉 PAYMENT CONFIRMED • ACCESS GRANTED! 🎉</b></blockquote>\n"
+        f"<blockquote><b>🏆 VIP Channel:</b> <b>{channel['name']}</b>\n"
+        f"<b>👤 Subscriber ID:</b> <code>{user_id}</code>\n"
+        f"<b>⚡ Status:</b> <b>Active & Verified ✅</b></blockquote>\n"
+        f"<blockquote><b>📌 IMPORTANT INSTRUCTIONS:</b>\n"
         f"1️⃣ <b>Click '🚀 Join VIP Channel Now' below immediately</b>\n"
         f"2️⃣ Do not forward or share this link with anyone\n"
-        f"3️⃣ Access is securely locked to your Telegram account\n\n"
-        f"╔════════════════════════════════════╗\n"
-        f"  ⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b>\n"
-        f"╚════════════════════════════════════╝\n\n"
-        f"🏆Admin - {ADMIN_CONTACT}\n\n"
+        f"3️⃣ Access is securely locked to your Telegram account</blockquote>\n"
+        f"<blockquote>⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b>\n"
+        f"──────────────────────────\n"
+        f"🏆 Admin - {ADMIN_CONTACT}</blockquote>\n\n"
         f"{action_text}"
     )
 
@@ -1250,23 +1247,20 @@ async def get_or_create_qr_code(
 def build_qr_payment_caption(channel_name: str, price: float, qr_id: str) -> str:
     """Rich, engaging payment QR caption with clear instructions and advanced emojis."""
     return (
-        f"👑 <b>PREMIUM VIP ACCESS PAYMENT</b> 👑\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏷️ <b>Channel:</b> <b>{channel_name}</b>\n"
-        f"💵 <b>Pay Amount:</b> <b>₹{price:.0f}</b> <i>(One-Time Fee)</i>\n"
-        f"🧾 <b>Payment Ref ID:</b> <code>{qr_id}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📲 <b>HOW TO PAY (FAST & EASY):</b>\n"
+        f"<blockquote><b>👑 PREMIUM VIP ACCESS PAYMENT 👑</b></blockquote>\n"
+        f"<blockquote><b>🏷️ Channel:</b> <b>{channel_name}</b>\n"
+        f"<b>💵 Pay Amount:</b> <b>₹{price:.0f}</b> <i>(One-Time Fee)</i>\n"
+        f"<b>🧾 Payment Ref ID:</b> <code>{qr_id}</code></blockquote>\n"
+        f"<blockquote><b>📲 HOW TO PAY (FAST & EASY):</b>\n"
         f"1️⃣ <b>Scan the QR Code</b> above with any UPI app\n"
         f"   └ <i>GPay • PhonePe • Paytm • BHIM • CRED</i>\n"
         f"2️⃣ Complete the payment of <b>₹{price:.0f}</b>\n"
         f"3️⃣ <b>Wait 3–5 seconds</b> — payment is auto-detected!\n"
-        f"   └ <i>Your VIP link will be delivered right here instantly! 🚀</i>\n\n"
-        f"╔════════════════════════════════════╗\n"
-        f"  ⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b>\n"
-        f"╚════════════════════════════════════╝\n\n"
-        f"🏆Admin - {ADMIN_CONTACT}\n"
-        f"💬 <b>Need help?</b> Share your Ref ID (<code>{qr_id}</code>) with Admin."
+        f"   └ <i>Your VIP link will be delivered right here instantly! 🚀</i></blockquote>\n"
+        f"<blockquote>⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b>\n"
+        f"──────────────────────────\n"
+        f"🏆 Admin - {ADMIN_CONTACT}\n"
+        f"💬 <b>Need help?</b> Share your Ref ID (<code>{qr_id}</code>) with Admin.</blockquote>"
     )
 
 
@@ -1311,12 +1305,13 @@ async def handle_start_buy_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
         db.grant_free_access(DB_PATH, user.id, channel_id)
         await reply_or_send_text(
             update, ctx,
-            f"🎉 <b>FREE ACCESS GRANTED!</b> 🎉\n\n"
-            f"🏆 <b>VIP Channel:</b> <b>{channel['name']}</b>\n"
-            f"👤 <b>Subscriber:</b> <code>{user.id}</code>\n"
-            f"💰 <b>Access Fee:</b> <b>FREE (₹0) 🎁</b>\n"
-            f"🏆Admin - {ADMIN_CONTACT}\n\n"
-            f"Your private access link has been generated below with zero fee:",
+            f"<blockquote><b>🎉 FREE ACCESS GRANTED! 🎉</b></blockquote>\n"
+            f"<blockquote><b>🏆 VIP Channel:</b> <b>{channel['name']}</b>\n"
+            f"<b>👤 Subscriber:</b> <code>{user.id}</code>\n"
+            f"<b>💰 Access Fee:</b> <b>FREE (₹0) 🎁</b>\n"
+            f"──────────────────────────\n"
+            f"🏆 Admin - {ADMIN_CONTACT}</blockquote>\n\n"
+            f"👇 <b>Your private access link has been generated below with zero fee:</b>",
             parse_mode=ParseMode.HTML,
         )
         await send_protected_channel_link(ctx.bot, user.id, channel)
@@ -1414,12 +1409,13 @@ async def handle_start_buy_channel(update: Update, ctx: ContextTypes.DEFAULT_TYP
         db.grant_free_access(DB_PATH, user.id, channel_id)
         await reply_or_send_text(
             update, ctx,
-            f"🎉 <b>FREE ACCESS GRANTED!</b> 🎉\n\n"
-            f"🏆 <b>VIP Channel:</b> <b>{channel['name']}</b>\n"
-            f"👤 <b>Subscriber:</b> <code>{user.id}</code>\n"
-            f"💰 <b>Access Fee:</b> <b>FREE (₹0) 🎁</b>\n"
-            f"🏆Admin - {ADMIN_CONTACT}\n\n"
-            f"Your private access link has been generated below with zero fee:",
+            f"<blockquote><b>🎉 FREE ACCESS GRANTED! 🎉</b></blockquote>\n"
+            f"<blockquote><b>🏆 VIP Channel:</b> <b>{channel['name']}</b>\n"
+            f"<b>👤 Subscriber:</b> <code>{user.id}</code>\n"
+            f"<b>💰 Access Fee:</b> <b>FREE (₹0) 🎁</b>\n"
+            f"──────────────────────────\n"
+            f"🏆 Admin - {ADMIN_CONTACT}</blockquote>\n\n"
+            f"👇 <b>Your private access link has been generated below with zero fee:</b>",
             parse_mode=ParseMode.HTML,
         )
         await send_protected_channel_link(ctx.bot, user.id, channel)
@@ -1711,21 +1707,18 @@ async def cb_view_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         action_btn = InlineKeyboardButton(f"💳 Pay ₹{channel['price_inr']:.0f} via UPI QR 🚀", callback_data=f"buy:{channel_id}")
 
     text = (
-        f"👑 <b>{channel['name']}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📖 <b>Description & Perks:</b>\n"
+        f"<blockquote><b>👑 {channel['name']}</b></blockquote>\n"
+        f"<blockquote>📖 <b>Description & Perks:</b>\n"
         f"<i>{desc}</i>\n\n"
         f"💎 <b>Key Highlights:</b>\n"
         f"• 🚀 <i>Instant 1-Click Access</i>\n"
         f"• 🔒 <i>Private, Verified & Safe Content</i>\n"
-        f"• ⚡ <i>Zero Waiting Time • Auto-Processed</i>\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{status_line}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"╔════════════════════════════════════╗\n"
-        f"  ⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b>\n"
-        f"╚════════════════════════════════════╝\n\n"
-        f"🏆Admin - {ADMIN_CONTACT}"
+        f"• ⚡ <i>Zero Waiting Time • Auto-Processed</i>\n"
+        f"──────────────────────────\n"
+        f"{status_line}</blockquote>\n"
+        f"<blockquote>⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b>\n"
+        f"──────────────────────────\n"
+        f"🏆 Admin - {ADMIN_CONTACT}</blockquote>"
     )
 
     keyboard = InlineKeyboardMarkup([
@@ -2995,15 +2988,11 @@ async def render_post_preview(message, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
     if is_free:
         if custom_text:
-            header_text = f"{custom_text}\n\n"
+            header_block = f"<blockquote>{custom_text}</blockquote>\n"
         else:
-            header_text = (
-                f"🎁 <b>EXCLUSIVE FREE VIP CHANNEL ACCESS</b> 🎁\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🌟 <b>Channel:</b> <b>{ch_name}</b>\n"
-            )
+            header_block = f"<blockquote><b>🎁 EXCLUSIVE FREE VIP CHANNEL ACCESS 🎁</b></blockquote>\n"
         price_line = "💰 <b>Access Fee:</b> <b>FREE (₹0) 🎁</b>\n"
-        payment_mode_line = "⚡ <b>Instant Access:</b> Zero Payment • 100% Free Join\n"
+        payment_mode_line = "⚡ <b>Instant Access:</b> Zero Payment • 100% Free Join"
         action_line = "👇 <b>Tap the button below to join for free:</b>"
 
         btn_url = channel["link"] if link_mode == "direct" else f"https://t.me/{bot_me.username}?start=free_{channel['id']}"
@@ -3013,20 +3002,16 @@ async def render_post_preview(message, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         ])
     else:
         if custom_text:
-            header_text = f"{custom_text}\n\n"
+            header_block = f"<blockquote>{custom_text}</blockquote>\n"
         else:
-            header_text = (
-                f"🔥 <b>EXCLUSIVE VIP CHANNEL ACCESS</b> 🔥\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🌟 <b>Channel:</b> <b>{ch_name}</b>\n"
-            )
+            header_block = f"<blockquote><b>🔥 EXCLUSIVE VIP CHANNEL ACCESS 🔥</b></blockquote>\n"
 
         cross_price = ctx.user_data.get("post_cross_price")
         if cross_price and cross_price > 0:
             price_line = f"💰 <b>Access Fee:</b> <b>₹{price:.0f}</b> <s>₹{cross_price:.0f}</s> <i>(Limited Time Offer)</i>\n"
         else:
             price_line = f"💰 <b>Access Fee:</b> <b>₹{price:.0f}</b> <i>(Limited Time Offer)</i>\n"
-        payment_mode_line = "📲 <b>Payment Mode:</b> Any UPI App (PhonePe, GPay, Paytm, BHIM)\n"
+        payment_mode_line = "📲 <b>Payment Mode:</b> Any UPI App (PhonePe, GPay, Paytm, BHIM)"
         action_line = "👇 <b>Tap the button below to unlock instant VIP access:</b>"
 
         preview_kb = InlineKeyboardMarkup([
@@ -3034,14 +3019,12 @@ async def render_post_preview(message, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         ])
 
     preview_caption = (
-        f"{header_text}"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{header_block}"
+        f"<blockquote><b>🌟 Channel:</b> <b>{ch_name}</b>\n"
+        f"──────────────────────────\n"
         f"{price_line}"
-        f"{payment_mode_line}"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"╔════════════════════════════════════╗\n"
-        f"  ⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b>\n"
-        f"╚════════════════════════════════════╝\n\n"
+        f"{payment_mode_line}</blockquote>\n"
+        f"<blockquote>⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b></blockquote>\n\n"
         f"{action_line}"
     )
     if photo_file_id and len(preview_caption) > 1024:
