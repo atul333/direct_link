@@ -16,6 +16,8 @@ def get_connection(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=-32000")  # 32MB page cache
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
@@ -150,6 +152,13 @@ def init_db(db_path: str) -> None:
                 cur.execute("UPDATE users SET username = ? WHERE user_id = ?", (f"@{clean_name}", u["user_id"]))
     except Exception:
         pass
+
+    # --- Performance indexes ---------------------------------------------------
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_order ON payments(razorpay_order_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id, status)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_access_user_channel ON user_channel_access(user_id, channel_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_posts_channel ON posts(channel_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_channels_active ON channels(is_active)")
 
     conn.commit()
     conn.close()

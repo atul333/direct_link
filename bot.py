@@ -83,6 +83,28 @@ ADMIN_CONTACT      = os.getenv("ADMIN_CONTACT", "@videos69_Admin_Bot")
 SHARED_DB_PATH = os.getenv("SHARED_PREMIUM_DB", "/home/ubuntu/premium_shared.db")
 _known_users_cache: dict[int, str] = {}
 
+# --- Active channel TTL cache (60 s) -----------------------------------------
+_active_channels_cache: list = []
+_active_channels_cache_time: float = 0.0
+_CHANNEL_CACHE_TTL: float = 60.0
+
+def get_active_channels_cached() -> list:
+    """Return active channels from memory; refresh every 60 s."""
+    global _active_channels_cache, _active_channels_cache_time
+    if time.time() - _active_channels_cache_time > _CHANNEL_CACHE_TTL:
+        _active_channels_cache = get_active_channels_cached()
+        _active_channels_cache_time = time.time()
+    return _active_channels_cache
+
+def invalidate_channel_cache() -> None:
+    """Force cache refresh on next access (call after add/edit/delete channel)."""
+    global _active_channels_cache_time
+    _active_channels_cache_time = 0.0
+
+# --- Mandatory-channel membership TTL cache (per user, 5 min) ----------------
+_mandatory_cache: dict[int, tuple] = {}  # {user_id: (timestamp, [unjoined_list])}
+_MANDATORY_CACHE_TTL: float = 300.0  # 5 minutes
+
 
 async def track_user_action_fast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Zero-load user tracker: updates database only when user is new or username changed."""
@@ -100,7 +122,7 @@ async def track_user_action_fast(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     try:
         loop = asyncio.get_running_loop()
         loop.run_in_executor(None, db.upsert_user, DB_PATH, uid, uname, fname, lname)
-        if SHARED_DB_PATH:
+        if SHARED_DB_PATH and os.path.isfile(SHARED_DB_PATH):
             loop.run_in_executor(None, db.upsert_central_user, SHARED_DB_PATH, uid, uname, fname)
     except Exception:
         pass
@@ -233,9 +255,16 @@ async def is_user_in_channel(bot: Bot, user_id: int, chat_id: int) -> bool:
 
 
 async def get_unjoined_mandatory_channels(bot: Bot, user_id: int) -> list[dict]:
-    """Return list of mandatory channels the user has NOT joined yet. Admins bypass."""
+    """Return list of mandatory channels the user has NOT joined yet. Admins bypass.
+    Result is cached per user for 5 minutes to avoid repeated get_chat_member API calls.
+    """
     if is_admin(user_id):
         return []
+
+    now = time.time()
+    cached = _mandatory_cache.get(user_id)
+    if cached and (now - cached[0]) < _MANDATORY_CACHE_TTL:
+        return cached[1]
 
     unjoined = []
     for cid in MANDATORY_CHANNELS:
@@ -243,6 +272,8 @@ async def get_unjoined_mandatory_channels(bot: Bot, user_id: int) -> list[dict]:
         if not in_channel:
             info = await get_channel_info(bot, cid)
             unjoined.append(info)
+
+    _mandatory_cache[user_id] = (now, unjoined)
     return unjoined
 
 
@@ -1239,7 +1270,7 @@ async def cmd_checklinks(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     if not is_admin(update.effective_user.id):
         return
 
-    channels = db.get_active_channels(DB_PATH)
+    channels = get_active_channels_cached()
     if not channels:
         await update.message.reply_text("ℹ️ No active channels found in database.")
         return
@@ -1279,7 +1310,7 @@ async def cmd_setchatid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     args = ctx.args or []
     if len(args) < 2:
-        channels = db.get_active_channels(DB_PATH)
+        channels = get_active_channels_cached()
         ch_list = "\n".join(
             f"• <code>/setchatid {c['id']} &lt;chat_id&gt;</code> — <b>{c['name']}</b> (Chat ID: {row_get(c, 'chat_id') or '❌ Not Set'})"
             for c in channels
@@ -1336,7 +1367,7 @@ async def handle_admin_forward(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
                 InlineKeyboardButton(f"🗑️ Delete this Post #{fwd_msg_id} from Channel Now", callback_data=f"del_fwd_post:{chat_id}:{fwd_msg_id}")
             ])
 
-        channels = db.get_active_channels(DB_PATH)
+        channels = get_active_channels_cached()
         for c in channels:
             buttons.append([
                 InlineKeyboardButton(f"🛡️ Link Chat ID to {c['name']} (ID #{c['id']})", callback_data=f"link_cid:{c['id']}:{chat_id}")
@@ -1852,7 +1883,7 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await send_mandatory_channels_prompt(update, ctx, unjoined, "menu")
         return
 
-    channels = db.get_active_channels(DB_PATH)
+    channels = get_active_channels_cached()
     if not channels:
         await reply_or_send_text(update, ctx, "😔 No channels available right now. Check back soon!")
         return
@@ -2226,7 +2257,7 @@ async def cb_back_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if unjoined:
         return await send_mandatory_channels_prompt(query, ctx, unjoined, "menu")
 
-    channels = db.get_active_channels(DB_PATH)
+    channels = get_active_channels_cached()
     text = "🛍️ <b>Available Channels</b>\n\nTap a channel to get details:" if channels else "😔 No channels available right now."
     markup = channel_list_keyboard(channels, "view") if channels else None
 
@@ -2956,7 +2987,7 @@ async def post_get_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("⚠️ Please send a photo or type <code>skip</code>.", parse_mode=ParseMode.HTML)
         return POST_PHOTO
 
-    channels = db.get_active_channels(DB_PATH)
+    channels = get_active_channels_cached()
     is_free = ctx.user_data.get("is_free", False)
     step_label = "Step 2/3: Free Channel Link" if is_free else "Step 2/4: Private Channel Link"
     if channels:
@@ -2988,7 +3019,7 @@ async def post_get_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if text and text.strip().lower() not in ("skip", "/skip"):
         ctx.user_data["post_text"] = text
 
-    channels = db.get_active_channels(DB_PATH)
+    channels = get_active_channels_cached()
     is_free = ctx.user_data.get("is_free", False)
     step_label = "Step 2/3: Free Channel Link" if is_free else "Step 2/4: Private Channel Link"
     if channels:
@@ -3779,6 +3810,7 @@ def main() -> None:
     app = (
         Application.builder()
         .token(BOT_TOKEN)
+        .concurrent_updates(True)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
@@ -3933,7 +3965,14 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_guide_help,    pattern=r"^guide_help$"))
 
     logger.info("Bot is running…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        read_timeout=10,
+        write_timeout=10,
+        connect_timeout=10,
+        pool_timeout=30,
+    )
 
 
 if __name__ == "__main__":

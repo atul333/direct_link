@@ -8,6 +8,10 @@ import io
 import logging
 import urllib.parse
 
+import cv2
+import httpx
+import numpy as np
+from PIL import Image
 import qrcode
 import razorpay
 
@@ -64,19 +68,15 @@ def fetch_qr_payments(client: razorpay.Client, qr_id: str) -> list:
 
 def download_and_crop_razorpay_qr(image_url: str) -> bytes:
     """
-    Download the Razorpay QR image and crop to JUST the QR code — boundary to boundary.
-    No BHIM/UPI logos, no text, no payment app icons, no background.
+    Download the Razorpay QR image and return a clean, perfectly-cropped QR code.
 
-    1. First attempts to decode the UPI URI payload with cv2.QRCodeDetector.
-       If decoded, regenerates a clean, crisp, high-resolution QR image with zero raster artifacts.
-    2. If not decoded, locates the exact QR matrix bounding box using OpenCV detector points
-       or NumPy black/white transition-frequency analysis (finding the square QR block).
-    3. Crops the image cleanly to the QR code boundaries with a clean quiet-zone margin.
+    Strategy (in order of preference):
+    1. Decode UPI payload with cv2 -> regenerate a fresh clean QR (best quality).
+    2. Upscale 2x and retry decode (helps with low-res posters).
+    3. Use cv2.detect() bounding box (no full decode needed) to crop precisely.
+    4. NumPy transition-frequency scan to find the dense QR grid region.
+    5. Hardcoded crop targeting upper-centre of Razorpay poster (last resort).
     """
-    import httpx
-    from PIL import Image
-    import numpy as np
-
     if isinstance(image_url, str) and (image_url.startswith("http://") or image_url.startswith("https://")):
         resp = httpx.get(image_url, follow_redirects=True, timeout=15.0)
         resp.raise_for_status()
@@ -87,29 +87,45 @@ def download_and_crop_razorpay_qr(image_url: str) -> bytes:
         with open(image_url, "rb") as f:
             raw_bytes = f.read()
 
-    # Step 1: Attempt to decode the UPI payment payload directly with OpenCV
+    # ----- Strategy 1 & 2: cv2 decode -> regenerate clean QR ------------------
     pts = None
     try:
-        import cv2
         np_arr = np.frombuffer(raw_bytes, np.uint8)
         cv_img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         if cv_img is not None:
             detector = cv2.QRCodeDetector()
+
+            # Strategy 1: decode at original size
             val, pts, _ = detector.detectAndDecode(cv_img)
             if val and ("upi://" in val or "pa=" in val):
-                logger.info("Successfully decoded UPI payload from QR poster: %s...", val[:40])
+                logger.info("Strategy 1: Decoded UPI payload from QR poster: %s...", val[:40])
                 return generate_clean_qr_image(val)
+
+            # Strategy 2: upscale 2x and retry (helps low-res posters)
+            if not val:
+                big = cv2.resize(cv_img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+                val2, pts2, _ = detector.detectAndDecode(big)
+                if val2 and ("upi://" in val2 or "pa=" in val2):
+                    logger.info("Strategy 2: Decoded UPI payload from 2x upscaled poster: %s...", val2[:40])
+                    return generate_clean_qr_image(val2)
+                # Downscale pts2 back to original coordinates
+                if pts2 is not None and len(pts2) > 0:
+                    pts = pts2 / 2.0
+
+            # Strategy 3: use detect() bounding points (no full decode needed)
+            if pts is None or len(pts) == 0:
+                _, pts = detector.detect(cv_img)
+
     except Exception as exc:
-        logger.warning("cv2 QR decode failed or cv2 not available: %s", exc)
+        logger.warning("cv2 QR decode/detect failed: %s", exc)
         pts = None
 
-    # Step 2: Crop to exact QR bounding box
+    # ----- Strategy 3: crop via cv2 bounding box ------------------------------
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     w, h = img.size
-
     crop_box = None
+
     try:
-        # Check if cv2 detector found the corner points
         if pts is not None and len(pts) > 0:
             p = pts[0]
             x0 = int(min(pt[0] for pt in p))
@@ -118,60 +134,64 @@ def download_and_crop_razorpay_qr(image_url: str) -> bytes:
             y1 = int(max(pt[1] for pt in p))
             if (x1 - x0) > 40 and (y1 - y0) > 40:
                 crop_box = (x0, y0, x1, y1)
-                logger.info("Located QR bbox via OpenCV pts: %s", crop_box)
+                logger.info("Strategy 3: Located QR bbox via OpenCV pts: %s", crop_box)
+    except Exception as exc:
+        logger.warning("Strategy 3 bbox extraction failed: %s", exc)
 
-        # If not, use NumPy transition-frequency scan
-        if not crop_box:
+    # ----- Strategy 4: NumPy transition-frequency scan -----------------------
+    if not crop_box:
+        try:
             gray = np.array(img.convert("L"))
             binary = (gray < 128).astype(np.int8)
-            center_bin = binary[:, int(w * 0.15):int(w * 0.85)]
+            center_bin = binary[:, int(w * 0.1):int(w * 0.9)]
             h_trans = np.sum(np.abs(np.diff(center_bin, axis=1)), axis=1)
-            qr_rows = np.where(h_trans >= 12)[0]
-            if len(qr_rows) > 30:
+            qr_rows = np.where(h_trans >= 10)[0]
+            if len(qr_rows) > 20:
                 gaps = np.where(np.diff(qr_rows) > 5)[0]
                 segs = np.split(qr_rows, gaps + 1)
                 longest_row = max(segs, key=len)
-                y0, y1 = int(longest_row[0]), int(longest_row[-1])
-
-                qr_band = binary[y0:y1, :]
+                y0_n, y1_n = int(longest_row[0]), int(longest_row[-1])
+                qr_band = binary[y0_n:y1_n, :]
                 v_trans = np.sum(np.abs(np.diff(qr_band, axis=0)), axis=0)
-                qr_cols = np.where(v_trans >= 12)[0]
-                if len(qr_cols) > 30:
+                qr_cols = np.where(v_trans >= 10)[0]
+                if len(qr_cols) > 20:
                     gaps_c = np.where(np.diff(qr_cols) > 5)[0]
                     segs_c = np.split(qr_cols, gaps_c + 1)
                     longest_col = max(segs_c, key=len)
-                    x0, x1 = int(longest_col[0]), int(longest_col[-1])
-                    crop_box = (x0, y0, x1, y1)
-                    logger.info("Located QR bbox via transition analysis: %s", crop_box)
+                    x0_n, x1_n = int(longest_col[0]), int(longest_col[-1])
+                    crop_box = (x0_n, y0_n, x1_n, y1_n)
+                    logger.info("Strategy 4: Located QR bbox via transition analysis: %s", crop_box)
+        except Exception as exc:
+            logger.warning("Strategy 4 transition scan failed: %s", exc)
 
-        if crop_box:
-            x0, y0, x1, y1 = crop_box
-            qr_w, qr_h = x1 - x0, y1 - y0
-            # Clean quiet-zone padding (~4% of QR dimension, min 10px)
-            pad_x = max(10, int(qr_w * 0.04))
-            pad_y = max(10, int(qr_h * 0.04))
-            final_box = (
-                max(0, x0 - pad_x),
-                max(0, y0 - pad_y),
-                min(w, x1 + pad_x),
-                min(h, y1 + pad_y),
-            )
-            logger.info("Final QR crop box: %s (original %dx%d)", final_box, w, h)
-            cropped = img.crop(final_box)
-            buf = io.BytesIO()
-            cropped.save(buf, format="PNG")
-            buf.seek(0)
-            return buf.getvalue()
+    # Apply detected crop box with generous quiet-zone padding
+    if crop_box:
+        x0, y0, x1, y1 = crop_box
+        qr_w, qr_h = x1 - x0, y1 - y0
+        # Use 8% padding each side so the quiet zone is never cut
+        pad_x = max(20, int(qr_w * 0.08))
+        pad_y = max(20, int(qr_h * 0.08))
+        final_box = (
+            max(0, x0 - pad_x),
+            max(0, y0 - pad_y),
+            min(w, x1 + pad_x),
+            min(h, y1 + pad_y),
+        )
+        logger.info("Final QR crop box: %s (original %dx%d)", final_box, w, h)
+        cropped = img.crop(final_box)
+        buf = io.BytesIO()
+        cropped.save(buf, format="PNG")
+        buf.seek(0)
+        return buf.getvalue()
 
-    except Exception as exc:
-        logger.warning("QR crop auto-detect failed: %s", exc)
-
-    # Fallback only if all detection fails
+    # ----- Strategy 5: hardcoded fallback targeting Razorpay poster layout ----
+    # Razorpay posters typically have the QR centred in the upper portion.
+    logger.warning("All QR detection strategies failed; using hardcoded fallback crop")
     fallback_box = (
-        int(w * 0.15),
-        int(h * 0.35),
-        int(w * 0.85),
-        int(h * 0.65),
+        int(w * 0.08),   # 8% from left
+        int(h * 0.05),   # 5% from top
+        int(w * 0.92),   # 92% from left
+        int(h * 0.70),   # 70% from top
     )
     cropped = img.crop(fallback_box)
     buf = io.BytesIO()
@@ -187,8 +207,8 @@ def generate_clean_qr_image(upi_str: str) -> bytes:
     qr = qrcode.QRCode(
         version=None,
         error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=10,
-        border=2,
+        box_size=12,  # Larger modules = bigger/clearer QR
+        border=4,     # Standard quiet zone = 4 modules per QR spec
     )
     qr.add_data(upi_str)
     qr.make(fit=True)
