@@ -4,6 +4,7 @@ database.py — SQLite database layer for Channel Link Provider Bot
 
 import sqlite3
 import logging
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -11,15 +12,26 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+# ── Persistent singleton connection (one per process, thread-safe via lock) ──
+_DB_CONN: sqlite3.Connection | None = None
+_DB_LOCK = threading.Lock()
+
 def get_connection(db_path: str) -> sqlite3.Connection:
-    """Return a thread-safe SQLite connection with row factory."""
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA cache_size=-32000")  # 32MB page cache
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    """Return the shared persistent SQLite connection (creates once, reuses always).
+    Thread-safe: all callers acquire _DB_LOCK before executing SQL.
+    Eliminates the overhead of opening+PRAGMA-setting a new connection per call.
+    """
+    global _DB_CONN
+    if _DB_CONN is None:
+        _DB_CONN = sqlite3.connect(db_path, check_same_thread=False)
+        _DB_CONN.row_factory = sqlite3.Row
+        _DB_CONN.execute("PRAGMA journal_mode=WAL")
+        _DB_CONN.execute("PRAGMA synchronous=NORMAL")
+        _DB_CONN.execute("PRAGMA cache_size=-32000")  # 32MB page cache
+        _DB_CONN.execute("PRAGMA foreign_keys=ON")
+        _DB_CONN.execute("PRAGMA temp_store=MEMORY")  # Use memory for temp tables
+        logger.info("Persistent SQLite connection created: %s", db_path)
+    return _DB_CONN
 
 
 def init_db(db_path: str) -> None:
@@ -161,7 +173,6 @@ def init_db(db_path: str) -> None:
     cur.execute("CREATE INDEX IF NOT EXISTS idx_channels_active ON channels(is_active)")
 
     conn.commit()
-    conn.close()
     logger.info("Database initialised at %s", db_path)
 
 
@@ -190,7 +201,6 @@ def upsert_user(db_path: str, user_id: int, username: str,
             last_name  = excluded.last_name
     """, (user_id, uname, first_name, last_name))
     conn.commit()
-    conn.close()
 
 
 def upsert_central_user(shared_db_path: str, user_id: int, username: str, first_name: str) -> None:
@@ -218,7 +228,6 @@ def upsert_central_user(shared_db_path: str, user_id: int, username: str, first_
                 updated_at = excluded.updated_at
         """, (user_id, uname, first_name))
         conn.commit()
-        conn.close()
     except Exception as e:
         logger.debug("Could not upsert central user: %s", e)
 
@@ -228,14 +237,12 @@ def get_all_users(db_path: str) -> list:
     rows = conn.execute(
         "SELECT user_id FROM users WHERE is_banned = 0"
     ).fetchall()
-    conn.close()
     return [r["user_id"] for r in rows]
 
 
 def get_user_count(db_path: str) -> int:
     conn = get_connection(db_path)
     count = conn.execute("SELECT COUNT(*) FROM users WHERE is_banned = 0").fetchone()[0]
-    conn.close()
     return count
 
 
@@ -243,14 +250,12 @@ def ban_user(db_path: str, user_id: int) -> None:
     conn = get_connection(db_path)
     conn.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (user_id,))
     conn.commit()
-    conn.close()
 
 
 def unban_user(db_path: str, user_id: int) -> None:
     conn = get_connection(db_path)
     conn.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (user_id,))
     conn.commit()
-    conn.close()
 
 
 def get_user(db_path: str, user_id: int) -> Optional[sqlite3.Row]:
@@ -258,7 +263,6 @@ def get_user(db_path: str, user_id: int) -> Optional[sqlite3.Row]:
     row = conn.execute(
         "SELECT * FROM users WHERE user_id = ?", (user_id,)
     ).fetchone()
-    conn.close()
     return row
 
 
@@ -274,7 +278,6 @@ def add_channel(db_path: str, name: str, link: str,
     """, (name, link, price_inr, description, admin_id, chat_id))
     channel_id = cur.lastrowid
     conn.commit()
-    conn.close()
     return channel_id
 
 
@@ -290,7 +293,6 @@ def update_channel(db_path: str, channel_id: int, **kwargs) -> bool:
         (*updates.values(), channel_id)
     )
     conn.commit()
-    conn.close()
     return True
 
 
@@ -311,7 +313,6 @@ def get_channel_by_chat_id(db_path: str, chat_id: str | int) -> Optional[sqlite3
         f"SELECT * FROM channels WHERE chat_id IN ({placeholders}) AND is_active = 1 LIMIT 1",
         variations,
     ).fetchone()
-    conn.close()
     return row
 
 
@@ -320,7 +321,6 @@ def get_channel(db_path: str, channel_id: int) -> Optional[sqlite3.Row]:
     row = conn.execute(
         "SELECT * FROM channels WHERE id = ?", (channel_id,)
     ).fetchone()
-    conn.close()
     return row
 
 
@@ -329,14 +329,12 @@ def get_active_channels(db_path: str) -> list:
     rows = conn.execute(
         "SELECT * FROM channels WHERE is_active = 1 ORDER BY id"
     ).fetchall()
-    conn.close()
     return rows
 
 
 def get_all_channels(db_path: str) -> list:
     conn = get_connection(db_path)
     rows = conn.execute("SELECT * FROM channels ORDER BY id").fetchall()
-    conn.close()
     return rows
 
 
@@ -344,7 +342,6 @@ def delete_channel(db_path: str, channel_id: int) -> None:
     conn = get_connection(db_path)
     conn.execute("UPDATE channels SET is_active = 0 WHERE id = ?", (channel_id,))
     conn.commit()
-    conn.close()
 
 
 # ── Payment helpers ────────────────────────────────────────────────────────────
@@ -358,7 +355,6 @@ def create_payment(db_path: str, user_id: int, channel_id: int,
     """, (user_id, channel_id, razorpay_order_id, amount_inr))
     payment_id = cur.lastrowid
     conn.commit()
-    conn.close()
     return payment_id
 
 
@@ -371,7 +367,6 @@ def store_qr_message_id(db_path: str, order_id: str, chat_id: int, message_id: i
         WHERE razorpay_order_id = ?
     """, (chat_id, message_id, order_id))
     conn.commit()
-    conn.close()
 
 
 def get_qr_message_info(db_path: str, order_id: str) -> Optional[dict]:
@@ -384,7 +379,6 @@ def get_qr_message_info(db_path: str, order_id: str) -> Optional[dict]:
           AND qr_message_id IS NOT NULL
         ORDER BY id DESC LIMIT 1
     """, (order_id,)).fetchone()
-    conn.close()
     if row and row["qr_message_id"]:
         return {"chat_id": row["qr_message_chat_id"], "message_id": row["qr_message_id"]}
     return None
@@ -400,7 +394,6 @@ def get_latest_qr_message_for_user(db_path: str, user_id: int) -> Optional[dict]
           AND qr_message_id IS NOT NULL
         ORDER BY id DESC LIMIT 1
     """, (user_id,)).fetchone()
-    conn.close()
     if row and row["qr_message_id"]:
         return {"chat_id": row["qr_message_chat_id"], "message_id": row["qr_message_id"]}
     return None
@@ -411,7 +404,6 @@ def get_payment_by_order(db_path: str, order_id: str) -> Optional[sqlite3.Row]:
     row = conn.execute(
         "SELECT * FROM payments WHERE razorpay_order_id = ?", (order_id,)
     ).fetchone()
-    conn.close()
     return row
 
 
@@ -428,7 +420,6 @@ def find_payment(db_path: str, identifier: str) -> Optional[sqlite3.Row]:
            OR razorpay_payment_id = ?
         ORDER BY created_at DESC LIMIT 1
     """, (clean_id, clean_id, raw_id, raw_id)).fetchone()
-    conn.close()
     return row
 
 
@@ -439,7 +430,6 @@ def get_pending_payment(db_path: str, user_id: int, channel_id: int) -> Optional
         WHERE user_id = ? AND channel_id = ? AND status = 'pending'
         ORDER BY created_at DESC LIMIT 1
     """, (user_id, channel_id)).fetchone()
-    conn.close()
     return row
 
 
@@ -451,7 +441,6 @@ def get_all_pending_payments(db_path: str, hours: int = 24) -> list:
         WHERE status = 'pending' AND created_at >= datetime('now', '-{int(hours)} hours')
         ORDER BY created_at DESC
     """).fetchall()
-    conn.close()
     return rows
 
 
@@ -463,8 +452,7 @@ def confirm_payment(db_path: str, order_id: str, razorpay_payment_id: str) -> Op
         "SELECT * FROM payments WHERE razorpay_order_id = ?", (order_id,)
     ).fetchone()
     if not row:
-        conn.close()
-        return None
+            return None
     conn.execute("""
         UPDATE payments
         SET status = 'paid', razorpay_payment_id = ?, paid_at = datetime('now')
@@ -476,7 +464,6 @@ def confirm_payment(db_path: str, order_id: str, razorpay_payment_id: str) -> Op
         VALUES (?, ?)
     """, (row["user_id"], row["channel_id"]))
     conn.commit()
-    conn.close()
     return row["channel_id"]
 
 
@@ -487,7 +474,6 @@ def grant_free_access(db_path: str, user_id: int, channel_id: int) -> None:
         VALUES (?, ?)
     """, (user_id, channel_id))
     conn.commit()
-    conn.close()
 
 
 def has_access(db_path: str, user_id: int, channel_id: int) -> bool:
@@ -496,7 +482,6 @@ def has_access(db_path: str, user_id: int, channel_id: int) -> bool:
         SELECT 1 FROM user_channel_access
         WHERE user_id = ? AND channel_id = ?
     """, (user_id, channel_id)).fetchone()
-    conn.close()
     return row is not None
 
 
@@ -509,7 +494,6 @@ def get_user_purchases(db_path: str, user_id: int) -> list:
         WHERE uca.user_id = ?
         ORDER BY uca.granted_at DESC
     """, (user_id,)).fetchall()
-    conn.close()
     return rows
 
 
@@ -536,7 +520,6 @@ def get_stats(db_path: str) -> dict:
         ORDER BY revenue DESC
     """).fetchall()
 
-    conn.close()
     return {
         "total_users": total_users,
         "active_users": active_users,
@@ -557,7 +540,6 @@ def log_broadcast(db_path: str, admin_id: int, channel_id: Optional[int],
         VALUES (?, ?, ?, ?, ?)
     """, (admin_id, channel_id, message_text, sent, failed))
     conn.commit()
-    conn.close()
 
 
 def get_payments_for_channel(db_path: str, channel_id: int) -> list:
@@ -569,7 +551,6 @@ def get_payments_for_channel(db_path: str, channel_id: int) -> list:
         WHERE p.channel_id = ? AND p.status = 'paid'
         ORDER BY p.paid_at DESC
     """, (channel_id,)).fetchall()
-    conn.close()
     return rows
 
 
@@ -586,7 +567,6 @@ def create_post(db_path: str, admin_id: int, channel_id: int, title: str,
     """, (admin_id, channel_id, title, caption, photo_file_id, price_inr, target_channel, channel_msg_id, cross_price_inr))
     post_id = cur.lastrowid
     conn.commit()
-    conn.close()
     return post_id
 
 
@@ -594,7 +574,6 @@ def update_post_msg_id(db_path: str, post_id: int, channel_msg_id: int) -> None:
     conn = get_connection(db_path)
     conn.execute("UPDATE posts SET channel_msg_id = ? WHERE id = ?", (channel_msg_id, post_id))
     conn.commit()
-    conn.close()
 
 
 def get_post(db_path: str, post_id: int) -> Optional[sqlite3.Row]:
@@ -605,7 +584,6 @@ def get_post(db_path: str, post_id: int) -> Optional[sqlite3.Row]:
         JOIN channels c ON c.id = p.channel_id
         WHERE p.id = ?
     """, (post_id,)).fetchone()
-    conn.close()
     return row
 
 
@@ -617,7 +595,6 @@ def get_recent_posts(db_path: str, limit: int = 10) -> list:
         JOIN channels c ON c.id = p.channel_id
         ORDER BY p.id DESC LIMIT ?
     """, (limit,)).fetchall()
-    conn.close()
     return rows
 
 
@@ -636,7 +613,6 @@ def get_posts_for_channel(db_path: str, channel_id: int, channel_link: str = "",
         query += " OR title = ?"
         params.append(channel_name)
     rows = conn.execute(query, tuple(params)).fetchall()
-    conn.close()
     return rows
 
 
@@ -645,7 +621,6 @@ def delete_post(db_path: str, post_id: int) -> None:
     conn = get_connection(db_path)
     conn.execute("DELETE FROM posts WHERE id = ?", (post_id,))
     conn.commit()
-    conn.close()
 
 
 def delete_posts_for_channel(db_path: str, channel_id: int) -> int:
@@ -654,7 +629,6 @@ def delete_posts_for_channel(db_path: str, channel_id: int) -> int:
     cur = conn.execute("DELETE FROM posts WHERE channel_id = ?", (channel_id,))
     count = cur.rowcount
     conn.commit()
-    conn.close()
     return count
 
 
@@ -663,7 +637,6 @@ def deactivate_channel(db_path: str, channel_id: int) -> None:
     conn = get_connection(db_path)
     conn.execute("UPDATE channels SET is_active = 0 WHERE id = ?", (channel_id,))
     conn.commit()
-    conn.close()
 
 
 def get_post_by_msg_or_id(db_path: str, id_val: int) -> list:
@@ -672,7 +645,6 @@ def get_post_by_msg_or_id(db_path: str, id_val: int) -> list:
     rows = conn.execute("""
         SELECT * FROM posts WHERE id = ? OR channel_msg_id = ?
     """, (id_val, id_val)).fetchall()
-    conn.close()
     return rows
 
 
@@ -686,15 +658,13 @@ def purge_channel_and_posts(db_path: str, channel_id: int) -> None:
         conn.execute("DELETE FROM channels WHERE id = ?", (channel_id,))
         conn.commit()
     finally:
-        conn.close()
-
+        conn.execute("PRAGMA foreign_keys = ON")
 
 # ── Settings Helpers ──────────────────────────────────────────────────────────
 
 def get_setting(db_path: str, key: str, default: Optional[str] = None) -> Optional[str]:
     conn = get_connection(db_path)
     row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-    conn.close()
     return row["value"] if row else default
 
 
@@ -705,4 +675,3 @@ def set_setting(db_path: str, key: str, value: str) -> None:
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
     """, (key, value))
     conn.commit()
-    conn.close()

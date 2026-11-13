@@ -103,6 +103,28 @@ def invalidate_channel_cache() -> None:
     _active_channels_cache_time = 0.0
     _active_channels_cache = []
 
+# ── Async DB helpers (run blocking DB calls off the event loop) ──────────────
+async def db_get_channel(channel_id: int):
+    """Non-blocking: fetch channel from DB in thread pool."""
+    return await asyncio.to_thread(db.get_channel, DB_PATH, channel_id)
+
+async def db_has_access(user_id: int, channel_id: int) -> bool:
+    """Non-blocking: check user access in thread pool."""
+    return await asyncio.to_thread(db.has_access, DB_PATH, user_id, channel_id)
+
+async def db_get_post(post_id: int):
+    """Non-blocking: fetch post in thread pool."""
+    return await asyncio.to_thread(db.get_post, DB_PATH, post_id)
+
+async def db_get_user_purchases(user_id: int) -> list:
+    """Non-blocking: fetch user purchases in thread pool."""
+    return await asyncio.to_thread(db.get_user_purchases, DB_PATH, user_id)
+
+async def db_get_payment_by_order(order_id: str):
+    """Non-blocking: fetch payment by order in thread pool."""
+    return await asyncio.to_thread(db.get_payment_by_order, DB_PATH, order_id)
+
+
 # --- Mandatory-channel membership TTL cache (per user, 5 min) ----------------
 _mandatory_cache: dict[int, tuple] = {}  # {user_id: (timestamp, [unjoined_list])}
 _MANDATORY_CACHE_TTL: float = 300.0  # 5 minutes
@@ -1681,24 +1703,21 @@ def build_qr_payment_caption(channel_name: str, price: float, qr_id: str) -> str
 async def handle_start_buy_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE, post_id: int) -> None:
     """Handle user opening bot via deep-link buy button from a channel post."""
     user = update.effective_user
-    post = db.get_post(DB_PATH, post_id)
+    post = await db_get_post(post_id)
     if not post:
         await reply_or_send_text(update, ctx, "❌ This post or offer is no longer available. Use /menu to see all channels.")
         return
 
     channel_id = post["channel_id"]
-    channel = db.get_channel(DB_PATH, channel_id)
+    channel, already = await asyncio.gather(
+        db_get_channel(channel_id),
+        db_has_access(user.id, channel_id),
+    )
     if not channel or not channel["is_active"]:
         await reply_or_send_text(update, ctx, "❌ This channel is currently unavailable.")
         return
 
-    # Channel availability check
-    if not row_get(channel, "is_active", 1):
-        await reply_or_send_text(update, ctx, "❌ This channel is currently unavailable. Use /menu to see all channels.")
-        return
-
     price = post["price_inr"]
-    already = db.has_access(DB_PATH, user.id, channel_id)
 
     if already:
         await reply_or_send_text(
@@ -1867,12 +1886,7 @@ async def handle_start_buy_channel(update: Update, ctx: ContextTypes.DEFAULT_TYP
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if user:
-        uname = f"@{user.username.lstrip('@')}" if user.username else ""
-        db.upsert_user(DB_PATH, user.id, uname,
-                       user.first_name or "", user.last_name or "")
-
-    # Check mandatory channels
+    # Mandatory channel check (upsert_user handled by track_user_action_fast)
     unjoined = await get_unjoined_mandatory_channels(ctx.bot, user.id)
     if unjoined:
         arg_val = ctx.args[0].strip() if ctx.args else "start"
@@ -1920,10 +1934,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if user:
-        uname = f"@{user.username.lstrip('@')}" if user.username else ""
-        db.upsert_user(DB_PATH, user.id, uname, user.first_name or "", user.last_name or "")
-
     unjoined = await get_unjoined_mandatory_channels(ctx.bot, user.id)
     if unjoined:
         await send_mandatory_channels_prompt(update, ctx, unjoined, "menu")
@@ -1952,14 +1962,12 @@ async def cmd_mypurchases(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     user = update.effective_user
     if user:
         uname = f"@{user.username.lstrip('@')}" if user.username else ""
-        db.upsert_user(DB_PATH, user.id, uname, user.first_name or "", user.last_name or "")
-
     unjoined = await get_unjoined_mandatory_channels(ctx.bot, user.id)
     if unjoined:
         await send_mandatory_channels_prompt(update, ctx, unjoined, "mypurchases")
         return
 
-    purchases = db.get_user_purchases(DB_PATH, user.id)
+    purchases = await db_get_user_purchases(user.id)
     if not purchases:
         await reply_or_send_text(
             update, ctx,
@@ -2059,18 +2067,21 @@ async def cb_view_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     query = update.callback_query
     await query.answer()
     channel_id = int(query.data.split(":")[1])
-    channel = db.get_channel(DB_PATH, channel_id)
+    # Run channel fetch and mandatory check concurrently for speed
+    channel, unjoined = await asyncio.gather(
+        db_get_channel(channel_id),
+        get_unjoined_mandatory_channels(ctx.bot, query.from_user.id),
+    )
     if not channel:
         await query.edit_message_text("❌ Channel not found.")
         return
 
     user_id = query.from_user.id
-    unjoined = await get_unjoined_mandatory_channels(ctx.bot, user_id)
     if unjoined:
         await send_mandatory_channels_prompt(query, ctx, unjoined, f"c_{channel_id}")
         return
 
-    already = db.has_access(DB_PATH, user_id, channel_id)
+    already = await db_has_access(user_id, channel_id)
 
     desc = channel["description"] or "🌟 Exclusive VIP Access • Daily Premium Content, Media & Updates 🚀"
     if already:
@@ -2112,7 +2123,7 @@ async def cb_get_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     channel_id = int(query.data.split(":")[1])
     user_id = query.from_user.id
 
-    if not db.has_access(DB_PATH, user_id, channel_id):
+    if not await db_has_access(user_id, channel_id):
         await query.answer("❌ You don't have access. Please purchase first.", show_alert=True)
         return
 
