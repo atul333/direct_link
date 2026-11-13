@@ -14,12 +14,35 @@ import numpy as np
 from PIL import Image
 import qrcode
 import razorpay
+from requests.adapters import HTTPAdapter
 
 logger = logging.getLogger(__name__)
 
+# ── Persistent HTTP clients (reuse TCP+TLS connections for fast Razorpay calls) ──
+_RZP_CLIENT: razorpay.Client | None = None
+_RZP_AUTH: tuple[str, str] | None = None
+
+_HTTP_CLIENT = httpx.Client(
+    follow_redirects=True,
+    timeout=httpx.Timeout(12.0, connect=5.0),
+    limits=httpx.Limits(max_connections=30, max_keepalive_connections=15),
+)
+
 
 def get_razorpay_client(key_id: str, key_secret: str) -> razorpay.Client:
-    return razorpay.Client(auth=(key_id, key_secret))
+    """Return a persistent Razorpay client with pooled keep-alive connections."""
+    global _RZP_CLIENT, _RZP_AUTH
+    if _RZP_CLIENT is None or _RZP_AUTH != (key_id, key_secret):
+        client = razorpay.Client(auth=(key_id, key_secret))
+        try:
+            adapter = HTTPAdapter(pool_connections=30, pool_maxsize=30)
+            client.session.mount("https://", adapter)
+            client.session.mount("http://", adapter)
+        except Exception:
+            pass
+        _RZP_CLIENT = client
+        _RZP_AUTH = (key_id, key_secret)
+    return _RZP_CLIENT
 
 
 def create_order(client: razorpay.Client, amount_inr: float,
@@ -66,7 +89,7 @@ def fetch_qr_payments(client: razorpay.Client, qr_id: str) -> list:
     return res.get("items", []) if isinstance(res, dict) else res
 
 
-def download_and_crop_razorpay_qr(image_url: str) -> bytes:
+def download_and_crop_razorpay_qr(image_url: str, qr_id: str | None = None) -> bytes:
     """
     Download the Razorpay QR image and return a clean, perfectly-cropped QR code.
 
@@ -77,15 +100,27 @@ def download_and_crop_razorpay_qr(image_url: str) -> bytes:
     4. NumPy transition-frequency scan to find the dense QR grid region.
     5. Hardcoded crop targeting upper-centre of Razorpay poster (last resort).
     """
-    if isinstance(image_url, str) and (image_url.startswith("http://") or image_url.startswith("https://")):
-        resp = httpx.get(image_url, follow_redirects=True, timeout=15.0)
-        resp.raise_for_status()
-        raw_bytes = resp.content
-    elif isinstance(image_url, bytes):
-        raw_bytes = image_url
-    else:
-        with open(image_url, "rb") as f:
-            raw_bytes = f.read()
+    raw_bytes = None
+    # Fast path: bypass rzp.io shortlink redirect by requesting the direct QR endpoint first
+    if qr_id:
+        direct_url = f"https://api.razorpay.com/v1/l/qrcode/{qr_id}"
+        try:
+            resp = _HTTP_CLIENT.get(direct_url)
+            if resp.status_code == 200 and len(resp.content) > 500:
+                raw_bytes = resp.content
+        except Exception:
+            pass
+
+    if raw_bytes is None:
+        if isinstance(image_url, str) and (image_url.startswith("http://") or image_url.startswith("https://")):
+            resp = _HTTP_CLIENT.get(image_url)
+            resp.raise_for_status()
+            raw_bytes = resp.content
+        elif isinstance(image_url, bytes):
+            raw_bytes = image_url
+        else:
+            with open(image_url, "rb") as f:
+                raw_bytes = f.read()
 
     # ----- Strategy 1 & 2: cv2 decode -> regenerate clean QR ------------------
     pts = None
@@ -292,5 +327,3 @@ def verify_webhook_signature(body: bytes, signature: str, secret: str) -> bool:
         hashlib.sha256,
     ).hexdigest()
     return hmac.compare_digest(expected, signature)
-
-

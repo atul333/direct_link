@@ -12,26 +12,43 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-# ── Persistent singleton connection (one per process, thread-safe via lock) ──
-_DB_CONN: sqlite3.Connection | None = None
-_DB_LOCK = threading.Lock()
+# ── Per-thread persistent SQLite connection pool (WAL mode, zero contention) ──
+_THREAD_LOCAL = threading.local()
+_WRITE_LOCK = threading.Lock()
+_CENTRAL_INITIALISED: set[str] = set()
+
+
+def _configure_conn(conn: sqlite3.Connection) -> sqlite3.Connection:
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA cache_size=-32000")  # 32MB page cache
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    return conn
+
 
 def get_connection(db_path: str) -> sqlite3.Connection:
-    """Return the shared persistent SQLite connection (creates once, reuses always).
-    Thread-safe: all callers acquire _DB_LOCK before executing SQL.
-    Eliminates the overhead of opening+PRAGMA-setting a new connection per call.
+    """Return a per-thread persistent SQLite connection (creates once per thread, reuses always).
+    Safe against multi-thread cursor collisions and closed-connection errors.
     """
-    global _DB_CONN
-    if _DB_CONN is None:
-        _DB_CONN = sqlite3.connect(db_path, check_same_thread=False)
-        _DB_CONN.row_factory = sqlite3.Row
-        _DB_CONN.execute("PRAGMA journal_mode=WAL")
-        _DB_CONN.execute("PRAGMA synchronous=NORMAL")
-        _DB_CONN.execute("PRAGMA cache_size=-32000")  # 32MB page cache
-        _DB_CONN.execute("PRAGMA foreign_keys=ON")
-        _DB_CONN.execute("PRAGMA temp_store=MEMORY")  # Use memory for temp tables
-        logger.info("Persistent SQLite connection created: %s", db_path)
-    return _DB_CONN
+    conns: dict[str, sqlite3.Connection] = getattr(_THREAD_LOCAL, "conns", None)
+    if conns is None:
+        conns = {}
+        _THREAD_LOCAL.conns = conns
+
+    conn = conns.get(db_path)
+    if conn is not None:
+        try:
+            conn.execute("SELECT 1")
+            return conn
+        except Exception:
+            conns.pop(db_path, None)
+
+    conn = _configure_conn(sqlite3.connect(db_path, timeout=10.0, check_same_thread=False))
+    conns[db_path] = conn
+    return conn
 
 
 def init_db(db_path: str) -> None:
@@ -157,7 +174,7 @@ def init_db(db_path: str) -> None:
     # Ensure all existing usernames in the database have exactly one @ prefix
     try:
         cur.row_factory = sqlite3.Row
-        users = cur.execute("SELECT user_id, username FROM users WHERE username IS NOT NULL AND username != ''").fetchall()
+        users = cur.execute("SELECT user_id, username FROM users WHERE username IS NOT NULL AND username != '' AND username NOT LIKE '@%'").fetchall()
         for u in users:
             clean_name = str(u["username"]).strip().lstrip("@")
             if clean_name:
@@ -168,6 +185,7 @@ def init_db(db_path: str) -> None:
     # --- Performance indexes ---------------------------------------------------
     cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_order ON payments(razorpay_order_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id, status)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_status_created ON payments(status, created_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_access_user_channel ON user_channel_access(user_id, channel_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_posts_channel ON posts(channel_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_channels_active ON channels(is_active)")
@@ -192,42 +210,48 @@ def upsert_user(db_path: str, user_id: int, username: str,
                 first_name: str, last_name: str) -> None:
     conn = get_connection(db_path)
     uname = format_username(username)
-    conn.execute("""
-        INSERT INTO users (user_id, username, first_name, last_name)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            username   = excluded.username,
-            first_name = excluded.first_name,
-            last_name  = excluded.last_name
-    """, (user_id, uname, first_name, last_name))
-    conn.commit()
-
-
-def upsert_central_user(shared_db_path: str, user_id: int, username: str, first_name: str) -> None:
-    """Safely upsert user into central shared DB."""
-    if not shared_db_path:
-        return
-    try:
-        conn = sqlite3.connect(shared_db_path, timeout=5)
-        conn.execute("PRAGMA journal_mode=WAL")
+    with _WRITE_LOCK:
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS shared_users (
-                user_id     INTEGER PRIMARY KEY,
-                username    TEXT,
-                first_name  TEXT,
-                updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
-            )
-        """)
-        uname = format_username(username)
-        conn.execute("""
-            INSERT INTO shared_users (user_id, username, first_name, updated_at)
-            VALUES (?, ?, ?, datetime('now'))
+            INSERT INTO users (user_id, username, first_name, last_name)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 username   = excluded.username,
                 first_name = excluded.first_name,
-                updated_at = excluded.updated_at
-        """, (user_id, uname, first_name))
+                last_name  = excluded.last_name
+        """, (user_id, uname, first_name, last_name))
         conn.commit()
+
+
+def upsert_central_user(shared_db_path: str, user_id: int, username: str, first_name: str) -> None:
+    """Safely upsert user into central shared DB using per-thread persistent connection."""
+    if not shared_db_path:
+        return
+    try:
+        conn = get_connection(shared_db_path)
+        if shared_db_path not in _CENTRAL_INITIALISED:
+            with _WRITE_LOCK:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS shared_users (
+                        user_id     INTEGER PRIMARY KEY,
+                        username    TEXT,
+                        first_name  TEXT,
+                        updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+                    )
+                """)
+                conn.commit()
+            _CENTRAL_INITIALISED.add(shared_db_path)
+
+        uname = format_username(username)
+        with _WRITE_LOCK:
+            conn.execute("""
+                INSERT INTO shared_users (user_id, username, first_name, updated_at)
+                VALUES (?, ?, ?, datetime('now'))
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username   = excluded.username,
+                    first_name = excluded.first_name,
+                    updated_at = excluded.updated_at
+            """, (user_id, uname, first_name))
+            conn.commit()
     except Exception as e:
         logger.debug("Could not upsert central user: %s", e)
 
@@ -248,14 +272,16 @@ def get_user_count(db_path: str) -> int:
 
 def ban_user(db_path: str, user_id: int) -> None:
     conn = get_connection(db_path)
-    conn.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (user_id,))
-    conn.commit()
+    with _WRITE_LOCK:
+        conn.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (user_id,))
+        conn.commit()
 
 
 def unban_user(db_path: str, user_id: int) -> None:
     conn = get_connection(db_path)
-    conn.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (user_id,))
-    conn.commit()
+    with _WRITE_LOCK:
+        conn.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (user_id,))
+        conn.commit()
 
 
 def get_user(db_path: str, user_id: int) -> Optional[sqlite3.Row]:
@@ -272,12 +298,13 @@ def add_channel(db_path: str, name: str, link: str,
                 price_inr: float, description: str, admin_id: int,
                 chat_id: Optional[str] = None) -> int:
     conn = get_connection(db_path)
-    cur = conn.execute("""
-        INSERT INTO channels (name, link, price_inr, description, created_by, chat_id)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (name, link, price_inr, description, admin_id, chat_id))
-    channel_id = cur.lastrowid
-    conn.commit()
+    with _WRITE_LOCK:
+        cur = conn.execute("""
+            INSERT INTO channels (name, link, price_inr, description, created_by, chat_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (name, link, price_inr, description, admin_id, chat_id))
+        channel_id = cur.lastrowid
+        conn.commit()
     return channel_id
 
 
@@ -288,11 +315,12 @@ def update_channel(db_path: str, channel_id: int, **kwargs) -> bool:
         return False
     setters = ", ".join(f"{k} = ?" for k in updates)
     conn = get_connection(db_path)
-    conn.execute(
-        f"UPDATE channels SET {setters} WHERE id = ?",
-        (*updates.values(), channel_id)
-    )
-    conn.commit()
+    with _WRITE_LOCK:
+        conn.execute(
+            f"UPDATE channels SET {setters} WHERE id = ?",
+            (*updates.values(), channel_id)
+        )
+        conn.commit()
     return True
 
 
@@ -340,8 +368,9 @@ def get_all_channels(db_path: str) -> list:
 
 def delete_channel(db_path: str, channel_id: int) -> None:
     conn = get_connection(db_path)
-    conn.execute("UPDATE channels SET is_active = 0 WHERE id = ?", (channel_id,))
-    conn.commit()
+    with _WRITE_LOCK:
+        conn.execute("UPDATE channels SET is_active = 0 WHERE id = ?", (channel_id,))
+        conn.commit()
 
 
 # ── Payment helpers ────────────────────────────────────────────────────────────
@@ -349,24 +378,26 @@ def delete_channel(db_path: str, channel_id: int) -> None:
 def create_payment(db_path: str, user_id: int, channel_id: int,
                    razorpay_order_id: str, amount_inr: float) -> int:
     conn = get_connection(db_path)
-    cur = conn.execute("""
-        INSERT INTO payments (user_id, channel_id, razorpay_order_id, amount_inr)
-        VALUES (?, ?, ?, ?)
-    """, (user_id, channel_id, razorpay_order_id, amount_inr))
-    payment_id = cur.lastrowid
-    conn.commit()
+    with _WRITE_LOCK:
+        cur = conn.execute("""
+            INSERT INTO payments (user_id, channel_id, razorpay_order_id, amount_inr)
+            VALUES (?, ?, ?, ?)
+        """, (user_id, channel_id, razorpay_order_id, amount_inr))
+        payment_id = cur.lastrowid
+        conn.commit()
     return payment_id
 
 
 def store_qr_message_id(db_path: str, order_id: str, chat_id: int, message_id: int) -> None:
     """Persist the QR payment message location so it can be deleted after payment."""
     conn = get_connection(db_path)
-    conn.execute("""
-        UPDATE payments
-        SET qr_message_chat_id = ?, qr_message_id = ?
-        WHERE razorpay_order_id = ?
-    """, (chat_id, message_id, order_id))
-    conn.commit()
+    with _WRITE_LOCK:
+        conn.execute("""
+            UPDATE payments
+            SET qr_message_chat_id = ?, qr_message_id = ?
+            WHERE razorpay_order_id = ?
+        """, (chat_id, message_id, order_id))
+        conn.commit()
 
 
 def get_qr_message_info(db_path: str, order_id: str) -> Optional[dict]:
@@ -433,16 +464,56 @@ def get_pending_payment(db_path: str, user_id: int, channel_id: int) -> Optional
     return row
 
 
-def get_all_pending_payments(db_path: str, hours: int = 24) -> list:
-    """Fetch recent pending payments to poll Razorpay."""
+def get_all_pending_payments(
+    db_path: str,
+    hours: Optional[int] = None,
+    minutes: Optional[int] = None,
+    min_age_minutes: int = 0,
+    limit: int = 30,
+) -> list:
+    """Fetch recent pending payments to poll Razorpay without scanning hundreds of stale rows."""
     conn = get_connection(db_path)
-    rows = conn.execute(f"""
-        SELECT * FROM payments
-        WHERE status = 'pending' AND created_at >= datetime('now', '-{int(hours)} hours')
-        ORDER BY created_at DESC
-    """).fetchall()
+    if minutes is not None:
+        max_age_expr = f"-{int(minutes)} minutes"
+    else:
+        h = int(hours) if hours is not None else 1
+        max_age_expr = f"-{h} hours"
+
+    if min_age_minutes > 0:
+        min_age_expr = f"-{int(min_age_minutes)} minutes"
+        rows = conn.execute("""
+            SELECT * FROM payments
+            WHERE status = 'pending'
+              AND created_at >= datetime('now', ?)
+              AND created_at < datetime('now', ?)
+            ORDER BY created_at DESC
+            LIMIT ?
+        """, (max_age_expr, min_age_expr, int(limit))).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT * FROM payments
+            WHERE status = 'pending'
+              AND created_at >= datetime('now', ?)
+            ORDER BY created_at DESC
+            LIMIT ?
+        """, (max_age_expr, int(limit))).fetchall()
     return rows
 
+
+def expire_old_pending_payments(db_path: str, hours: int = 2) -> int:
+    """Mark abandoned pending QR orders older than `hours` as expired so poller stays fast."""
+    conn = get_connection(db_path)
+    with _WRITE_LOCK:
+        cur = conn.execute("""
+            UPDATE payments
+            SET status = 'expired'
+            WHERE status = 'pending'
+              AND created_at < datetime('now', ?)
+        """, (f"-{int(hours)} hours",))
+        count = cur.rowcount
+        if count > 0:
+            conn.commit()
+    return count
 
 
 def confirm_payment(db_path: str, order_id: str, razorpay_payment_id: str) -> Optional[int]:
@@ -452,28 +523,30 @@ def confirm_payment(db_path: str, order_id: str, razorpay_payment_id: str) -> Op
         "SELECT * FROM payments WHERE razorpay_order_id = ?", (order_id,)
     ).fetchone()
     if not row:
-            return None
-    conn.execute("""
-        UPDATE payments
-        SET status = 'paid', razorpay_payment_id = ?, paid_at = datetime('now')
-        WHERE razorpay_order_id = ?
-    """, (razorpay_payment_id, order_id))
-    # Grant access
-    conn.execute("""
-        INSERT OR IGNORE INTO user_channel_access (user_id, channel_id)
-        VALUES (?, ?)
-    """, (row["user_id"], row["channel_id"]))
-    conn.commit()
+        return None
+    with _WRITE_LOCK:
+        conn.execute("""
+            UPDATE payments
+            SET status = 'paid', razorpay_payment_id = ?, paid_at = datetime('now')
+            WHERE razorpay_order_id = ?
+        """, (razorpay_payment_id, order_id))
+        # Grant access
+        conn.execute("""
+            INSERT OR IGNORE INTO user_channel_access (user_id, channel_id)
+            VALUES (?, ?)
+        """, (row["user_id"], row["channel_id"]))
+        conn.commit()
     return row["channel_id"]
 
 
 def grant_free_access(db_path: str, user_id: int, channel_id: int) -> None:
     conn = get_connection(db_path)
-    conn.execute("""
-        INSERT OR IGNORE INTO user_channel_access (user_id, channel_id)
-        VALUES (?, ?)
-    """, (user_id, channel_id))
-    conn.commit()
+    with _WRITE_LOCK:
+        conn.execute("""
+            INSERT OR IGNORE INTO user_channel_access (user_id, channel_id)
+            VALUES (?, ?)
+        """, (user_id, channel_id))
+        conn.commit()
 
 
 def has_access(db_path: str, user_id: int, channel_id: int) -> bool:
@@ -535,11 +608,12 @@ def get_stats(db_path: str) -> dict:
 def log_broadcast(db_path: str, admin_id: int, channel_id: Optional[int],
                   message_text: str, sent: int, failed: int) -> None:
     conn = get_connection(db_path)
-    conn.execute("""
-        INSERT INTO broadcasts (admin_id, channel_id, message_text, sent_count, fail_count)
-        VALUES (?, ?, ?, ?, ?)
-    """, (admin_id, channel_id, message_text, sent, failed))
-    conn.commit()
+    with _WRITE_LOCK:
+        conn.execute("""
+            INSERT INTO broadcasts (admin_id, channel_id, message_text, sent_count, fail_count)
+            VALUES (?, ?, ?, ?, ?)
+        """, (admin_id, channel_id, message_text, sent, failed))
+        conn.commit()
 
 
 def get_payments_for_channel(db_path: str, channel_id: int) -> list:
@@ -561,19 +635,21 @@ def create_post(db_path: str, admin_id: int, channel_id: int, title: str,
                 target_channel: str, channel_msg_id: Optional[int] = None,
                 cross_price_inr: Optional[float] = None) -> int:
     conn = get_connection(db_path)
-    cur = conn.execute("""
-        INSERT INTO posts (admin_id, channel_id, title, caption, photo_file_id, price_inr, target_channel, channel_msg_id, cross_price_inr)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (admin_id, channel_id, title, caption, photo_file_id, price_inr, target_channel, channel_msg_id, cross_price_inr))
-    post_id = cur.lastrowid
-    conn.commit()
+    with _WRITE_LOCK:
+        cur = conn.execute("""
+            INSERT INTO posts (admin_id, channel_id, title, caption, photo_file_id, price_inr, target_channel, channel_msg_id, cross_price_inr)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (admin_id, channel_id, title, caption, photo_file_id, price_inr, target_channel, channel_msg_id, cross_price_inr))
+        post_id = cur.lastrowid
+        conn.commit()
     return post_id
 
 
 def update_post_msg_id(db_path: str, post_id: int, channel_msg_id: int) -> None:
     conn = get_connection(db_path)
-    conn.execute("UPDATE posts SET channel_msg_id = ? WHERE id = ?", (channel_msg_id, post_id))
-    conn.commit()
+    with _WRITE_LOCK:
+        conn.execute("UPDATE posts SET channel_msg_id = ? WHERE id = ?", (channel_msg_id, post_id))
+        conn.commit()
 
 
 def get_post(db_path: str, post_id: int) -> Optional[sqlite3.Row]:
@@ -619,24 +695,27 @@ def get_posts_for_channel(db_path: str, channel_id: int, channel_link: str = "",
 def delete_post(db_path: str, post_id: int) -> None:
     """Delete a single post from the database."""
     conn = get_connection(db_path)
-    conn.execute("DELETE FROM posts WHERE id = ?", (post_id,))
-    conn.commit()
+    with _WRITE_LOCK:
+        conn.execute("DELETE FROM posts WHERE id = ?", (post_id,))
+        conn.commit()
 
 
 def delete_posts_for_channel(db_path: str, channel_id: int) -> int:
     """Delete promotional posts for a specific channel from the DB without touching channel or purchases."""
     conn = get_connection(db_path)
-    cur = conn.execute("DELETE FROM posts WHERE channel_id = ?", (channel_id,))
-    count = cur.rowcount
-    conn.commit()
+    with _WRITE_LOCK:
+        cur = conn.execute("DELETE FROM posts WHERE channel_id = ?", (channel_id,))
+        count = cur.rowcount
+        conn.commit()
     return count
 
 
 def deactivate_channel(db_path: str, channel_id: int) -> None:
     """Soft-deactivate a channel (sets is_active = 0) without purging records or user access."""
     conn = get_connection(db_path)
-    conn.execute("UPDATE channels SET is_active = 0 WHERE id = ?", (channel_id,))
-    conn.commit()
+    with _WRITE_LOCK:
+        conn.execute("UPDATE channels SET is_active = 0 WHERE id = ?", (channel_id,))
+        conn.commit()
 
 
 def get_post_by_msg_or_id(db_path: str, id_val: int) -> list:
@@ -651,14 +730,15 @@ def get_post_by_msg_or_id(db_path: str, id_val: int) -> list:
 def purge_channel_and_posts(db_path: str, channel_id: int) -> None:
     """Completely delete a channel and all its promotional posts from the database."""
     conn = get_connection(db_path)
-    try:
-        conn.execute("PRAGMA foreign_keys = OFF")
-        conn.execute("DELETE FROM posts WHERE channel_id = ?", (channel_id,))
-        conn.execute("DELETE FROM user_channel_access WHERE channel_id = ?", (channel_id,))
-        conn.execute("DELETE FROM channels WHERE id = ?", (channel_id,))
-        conn.commit()
-    finally:
-        conn.execute("PRAGMA foreign_keys = ON")
+    with _WRITE_LOCK:
+        try:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute("DELETE FROM posts WHERE channel_id = ?", (channel_id,))
+            conn.execute("DELETE FROM user_channel_access WHERE channel_id = ?", (channel_id,))
+            conn.execute("DELETE FROM channels WHERE id = ?", (channel_id,))
+            conn.commit()
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
 
 # ── Settings Helpers ──────────────────────────────────────────────────────────
 
@@ -670,8 +750,9 @@ def get_setting(db_path: str, key: str, default: Optional[str] = None) -> Option
 
 def set_setting(db_path: str, key: str, value: str) -> None:
     conn = get_connection(db_path)
-    conn.execute("""
-        INSERT INTO settings (key, value) VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    """, (key, value))
-    conn.commit()
+    with _WRITE_LOCK:
+        conn.execute("""
+            INSERT INTO settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """, (key, value))
+        conn.commit()

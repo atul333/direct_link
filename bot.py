@@ -43,8 +43,9 @@ from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     BotCommand, ChatJoinRequest, Bot, CallbackQuery, Message,
 )
-from telegram.error import BadRequest, Forbidden
+from telegram.error import BadRequest, Forbidden, TimedOut, NetworkError, RetryAfter
 from telegram.constants import ParseMode, ChatMemberStatus
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes, ConversationHandler,
@@ -125,11 +126,27 @@ async def db_get_payment_by_order(order_id: str):
     return await asyncio.to_thread(db.get_payment_by_order, DB_PATH, order_id)
 
 
-# --- Mandatory-channel membership TTL cache (per user, 5 min) ----------------
-_mandatory_cache: dict[int, tuple] = {}  # {user_id: (timestamp, [unjoined_list])}
-_MANDATORY_CACHE_TTL: float = 300.0  # 5 minutes
+# --- Mandatory-channel membership TTL cache ----------------------------------
+# {user_id: (timestamp, [unjoined_list])}
+_mandatory_cache: dict[int, tuple] = {}
+_MANDATORY_CACHE_TTL: float = 900.0          # 15 min — verified users (all joined)
+_MANDATORY_CACHE_TTL_PARTIAL: float = 20.0   # 20 sec — unverified users (avoids API storm on rapid taps)
+_mandatory_inflight: dict[int, asyncio.Lock] = {}
 
-# ── Resilient Telegram API wrappers (suppress expired queries & unmodified edits) ──
+# Shared persistent AsyncClient for link health checks
+_ASYNC_HTTP_CLIENT = httpx.AsyncClient(
+    timeout=httpx.Timeout(12.0, connect=5.0),
+    follow_redirects=True,
+    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+    headers={
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        )
+    },
+)
+
+# ── Resilient Telegram API wrappers (suppress expired queries, unmodified edits & timeouts) ──
 _orig_callback_query_answer = CallbackQuery.answer
 _orig_callback_query_edit = CallbackQuery.edit_message_text
 _orig_message_edit_text = Message.edit_text
@@ -143,14 +160,17 @@ async def _resilient_callback_query_answer(self, *args, **kwargs):
             logger.debug("Silently ignored expired/invalid callback query: %s", exc)
             return None
         raise
+    except (TimedOut, NetworkError) as exc:
+        logger.debug("Silently ignored timeout on callback query answer: %s", exc)
+        return None
 
 async def _resilient_callback_query_edit(self, *args, **kwargs):
     try:
         return await _orig_callback_query_edit(self, *args, **kwargs)
     except BadRequest as exc:
         msg = str(exc).lower()
-        if "message is not modified" in msg:
-            logger.debug("Silently ignored message not modified in query edit: %s", exc)
+        if "message is not modified" in msg or "message to edit not found" in msg:
+            logger.debug("Silently ignored benign BadRequest in query edit: %s", exc)
             return None
         raise
 
@@ -159,8 +179,8 @@ async def _resilient_message_edit_text(self, *args, **kwargs):
         return await _orig_message_edit_text(self, *args, **kwargs)
     except BadRequest as exc:
         msg = str(exc).lower()
-        if "message is not modified" in msg:
-            logger.debug("Silently ignored message not modified in msg edit: %s", exc)
+        if "message is not modified" in msg or "message to edit not found" in msg:
+            logger.debug("Silently ignored benign BadRequest in msg edit: %s", exc)
             return self
         raise
 
@@ -255,14 +275,16 @@ def admin_channel_keyboard(channels: list, prefix: str) -> InlineKeyboardMarkup:
 # ──────────────────────────────────────────────────────────────────────────────
 
 CHANNEL_INFO_CACHE: dict[int, dict] = {}
+_UNREACHABLE_MANDATORY_UNTIL: dict[int, float] = {}
 
 
 async def get_channel_info(bot: Bot, chat_id: int) -> dict:
-    """Fetch title and invite link for a channel, with caching."""
+    """Fetch title and invite link for a channel, with smart caching."""
     now = time.time()
     if chat_id in CHANNEL_INFO_CACHE:
         cached = CHANNEL_INFO_CACHE[chat_id]
-        if now - cached["updated_at"] < 3600 and cached.get("invite_link"):
+        ttl = 3600.0 if cached.get("invite_link") else 600.0
+        if now - cached["updated_at"] < ttl:
             return cached
 
     title = f"Channel {chat_id}"
@@ -285,6 +307,7 @@ async def get_channel_info(bot: Bot, chat_id: int) -> dict:
                 logger.debug("Could not create invite link for %s: %s", chat_id, e)
     except Exception as exc:
         logger.warning("Could not get chat details for %s: %s (ensure bot is added as admin)", chat_id, exc)
+        _UNREACHABLE_MANDATORY_UNTIL[chat_id] = now + 600.0
 
     info = {
         "chat_id": chat_id,
@@ -298,6 +321,10 @@ async def get_channel_info(bot: Bot, chat_id: int) -> dict:
 
 async def is_user_in_channel(bot: Bot, user_id: int, chat_id: int) -> bool:
     """Check if user is a member/admin in the specified channel."""
+    now = time.time()
+    if _UNREACHABLE_MANDATORY_UNTIL.get(chat_id, 0.0) > now:
+        return True
+
     try:
         member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
         return member.status in (
@@ -310,39 +337,67 @@ async def is_user_in_channel(bot: Bot, user_id: int, chat_id: int) -> bool:
         err_msg = str(exc).lower()
         if "user not found" in err_msg or "member not found" in err_msg:
             return False
-        if "chat not found" in err_msg or "not a member" in err_msg or "bot was kicked" in err_msg:
-            # Bot is not an admin in this channel yet
+        if "chat not found" in err_msg or "not a member" in err_msg or "bot was kicked" in err_msg or "not enough rights" in err_msg:
+            # Bot is not an admin in this channel yet — suppress for 10 min so we don't spam API
             logger.warning("Bot is not an admin in mandatory channel %s: %s", chat_id, exc)
+            _UNREACHABLE_MANDATORY_UNTIL[chat_id] = now + 600.0
             return True
         return False
 
 
 async def get_unjoined_mandatory_channels(bot: Bot, user_id: int, bypass_cache: bool = False) -> list[dict]:
     """Return list of mandatory channels the user has NOT joined yet. Admins bypass.
-    Result for verified users (all joined) is cached for 5 minutes to avoid repeated get_chat_member API calls.
+    Checks all mandatory channels concurrently (asyncio.gather) and caches both
+    verified users (15 min) and unverified users (20 s) to eliminate getChatMember storms.
     """
-    if is_admin(user_id):
+    if is_admin(user_id) or not MANDATORY_CHANNELS:
         return []
 
     now = time.time()
     if not bypass_cache:
         cached = _mandatory_cache.get(user_id)
-        if cached and (now - cached[0]) < _MANDATORY_CACHE_TTL:
-            return cached[1]
+        if cached:
+            ts, unjoined_cached = cached
+            ttl = _MANDATORY_CACHE_TTL if not unjoined_cached else _MANDATORY_CACHE_TTL_PARTIAL
+            if (now - ts) < ttl:
+                return unjoined_cached
 
-    unjoined = []
-    for cid in MANDATORY_CHANNELS:
-        in_channel = await is_user_in_channel(bot, user_id, cid)
-        if not in_channel:
-            info = await get_channel_info(bot, cid)
-            unjoined.append(info)
+    lock = _mandatory_inflight.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _mandatory_inflight[user_id] = lock
 
-    if not unjoined:
-        _mandatory_cache[user_id] = (now, [])
-    else:
-        _mandatory_cache.pop(user_id, None)
+    async with lock:
+        now = time.time()
+        if not bypass_cache:
+            cached = _mandatory_cache.get(user_id)
+            if cached:
+                ts, unjoined_cached = cached
+                ttl = _MANDATORY_CACHE_TTL if not unjoined_cached else _MANDATORY_CACHE_TTL_PARTIAL
+                if (now - ts) < ttl:
+                    return unjoined_cached
 
-    return unjoined
+        results = await asyncio.gather(
+            *(is_user_in_channel(bot, user_id, cid) for cid in MANDATORY_CHANNELS),
+            return_exceptions=True,
+        )
+
+        unjoined_cids = [
+            cid for cid, joined in zip(MANDATORY_CHANNELS, results)
+            if not (isinstance(joined, bool) and joined)
+        ]
+
+        if unjoined_cids:
+            infos = await asyncio.gather(
+                *(get_channel_info(bot, cid) for cid in unjoined_cids),
+                return_exceptions=True,
+            )
+            unjoined = [info for info in infos if isinstance(info, dict)]
+        else:
+            unjoined = []
+
+        _mandatory_cache[user_id] = (time.time(), unjoined)
+        return unjoined
 
 
 def format_user_display(username: Optional[str], fallback: str = "—") -> str:
@@ -879,61 +934,86 @@ async def start_webhook_server(bot) -> web.AppRunner:
     return runner
 
 
+async def _check_single_pending_payment(bot, client, p, sem: asyncio.Semaphore) -> None:
+    """Non-blocking worker for checking a single pending payment off the event loop."""
+    ref_id = p["razorpay_order_id"]
+    async with sem:
+        try:
+            if ref_id.startswith("qr_"):
+                payments_list = await asyncio.to_thread(pay.fetch_qr_payments, client, ref_id)
+                if payments_list:
+                    for item in payments_list:
+                        if item.get("status") in ("captured", "authorized"):
+                            payment_id = item.get("id")
+                            method = item.get("method", "UPI QR")
+                            logger.info("Auto-poller detected paid QR code: %s", ref_id)
+                            await process_successful_payment(
+                                bot,
+                                ref_id,
+                                payment_id,
+                                p["amount_inr"],
+                                method,
+                            )
+                            break
+            else:
+                order = await asyncio.to_thread(pay.fetch_order, client, ref_id)
+                if order.get("status") == "paid" or order.get("amount_paid", 0) >= order.get("amount", 1):
+                    payments_list = await asyncio.to_thread(pay.fetch_order_payments, client, ref_id)
+                    payment_id = ""
+                    method = "Razorpay Poller"
+                    if payments_list:
+                        for item in payments_list:
+                            if item.get("status") in ("captured", "authorized"):
+                                payment_id = item.get("id")
+                                method = item.get("method", "UPI/Card")
+                                break
+                        if not payment_id and payments_list:
+                            payment_id = payments_list[0].get("id", "")
+
+                    logger.info("Auto-poller detected paid order: %s", ref_id)
+                    await process_successful_payment(
+                        bot,
+                        ref_id,
+                        payment_id or f"auto_{ref_id}",
+                        p["amount_inr"],
+                        method,
+                    )
+        except Exception as err:
+            logger.debug("Poller error checking %s: %s", ref_id, err)
+
+
 async def poll_pending_payments(bot) -> None:
-    """Background task checking pending Razorpay QR codes & orders every 5 seconds."""
-    logger.info("Payment auto-poller worker started.")
+    """Non-blocking tiered background task checking pending Razorpay QR codes & orders."""
+    logger.info("Payment auto-poller worker started (non-blocking tiered mode).")
+    sem = asyncio.Semaphore(4)
+    cycle = 0
     while True:
         try:
-            await asyncio.sleep(5)
-            pending_orders = db.get_all_pending_payments(DB_PATH, hours=24)
+            await asyncio.sleep(6)
+            cycle += 1
+
+            # Tier 1: Active recent QRs (last 15 minutes) — checked every 6s
+            pending_orders = await asyncio.to_thread(
+                db.get_all_pending_payments, DB_PATH, minutes=15, limit=25
+            )
+
+            # Tier 2: Older QRs (15 to 90 minutes) — checked once every ~60s + expire >2h stale rows
+            if cycle % 10 == 0:
+                older_orders = await asyncio.to_thread(
+                    db.get_all_pending_payments, DB_PATH, minutes=90, min_age_minutes=15, limit=25
+                )
+                if older_orders:
+                    pending_orders = list(pending_orders) + list(older_orders)
+                await asyncio.to_thread(db.expire_old_pending_payments, DB_PATH, 2)
+
             if not pending_orders:
                 continue
 
             client = rzp_client()
-            for p in pending_orders:
-                ref_id = p["razorpay_order_id"]
-                try:
-                    if ref_id.startswith("qr_"):
-                        payments_list = pay.fetch_qr_payments(client, ref_id)
-                        if payments_list:
-                            for item in payments_list:
-                                if item.get("status") in ("captured", "authorized"):
-                                    payment_id = item.get("id")
-                                    method = item.get("method", "UPI QR")
-                                    logger.info("Auto-poller detected paid QR code: %s", ref_id)
-                                    await process_successful_payment(
-                                        bot,
-                                        ref_id,
-                                        payment_id,
-                                        p["amount_inr"],
-                                        method,
-                                    )
-                                    break
-                    else:
-                        order = pay.fetch_order(client, ref_id)
-                        if order.get("status") == "paid" or order.get("amount_paid", 0) >= order.get("amount", 1):
-                            payments_list = pay.fetch_order_payments(client, ref_id)
-                            payment_id = ""
-                            method = "Razorpay Poller"
-                            if payments_list:
-                                for item in payments_list:
-                                    if item.get("status") in ("captured", "authorized"):
-                                        payment_id = item.get("id")
-                                        method = item.get("method", "UPI/Card")
-                                        break
-                                if not payment_id and payments_list:
-                                    payment_id = payments_list[0].get("id", "")
-
-                            logger.info("Auto-poller detected paid order: %s", ref_id)
-                            await process_successful_payment(
-                                bot,
-                                ref_id,
-                                payment_id or f"auto_{ref_id}",
-                                p["amount_inr"],
-                                method,
-                            )
-                except Exception as err:
-                    logger.debug("Poller error checking %s: %s", ref_id, err)
+            await asyncio.gather(
+                *(_check_single_pending_payment(bot, client, p, sem) for p in pending_orders),
+                return_exceptions=True,
+            )
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -978,65 +1058,61 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
             clean_link = f"https://t.me/{clean_link.lstrip('@')}"
 
     try:
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-            resp = await client.get(
-                clean_link,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
-            )
-            # Transient rate limits or server errors MUST NEVER mark channel dead!
-            if resp.status_code in (429, 500, 502, 503, 504):
-                logger.warning("[LINK CHECK] Transient HTTP %d for %s — skipping check", resp.status_code, clean_link)
-                return True, f"Telegram rate limit/busy (HTTP {resp.status_code}) — treated as alive"
+        resp = await _ASYNC_HTTP_CLIENT.get(clean_link)
+        # Transient rate limits or server errors MUST NEVER mark channel dead!
+        if resp.status_code in (429, 500, 502, 503, 504):
+            logger.warning("[LINK CHECK] Transient HTTP %d for %s — skipping check", resp.status_code, clean_link)
+            return True, f"Telegram rate limit/busy (HTTP {resp.status_code}) — treated as alive"
 
-            if resp.status_code == 404:
-                return False, "Link not found (HTTP 404)"
+        if resp.status_code == 404:
+            return False, "Link not found (HTTP 404)"
 
-            if resp.status_code != 200:
-                logger.warning("[LINK CHECK] Unexpected HTTP %d for %s — skipping check", resp.status_code, clean_link)
-                return True, f"HTTP status {resp.status_code} (skipped)"
+        if resp.status_code != 200:
+            logger.warning("[LINK CHECK] Unexpected HTTP %d for %s — skipping check", resp.status_code, clean_link)
+            return True, f"HTTP status {resp.status_code} (skipped)"
 
-            text = resp.text
+        text = resp.text
 
-            # Anti-bot / Cloudflare / DDoS challenge protection:
-            if any(pat in text for pat in ["Just a moment...", "cf-chl-", "challenge-running", "Enable JavaScript and cookies to continue", "Attention Required"]):
-                logger.warning("[LINK CHECK] Anti-bot challenge page detected for %s — skipping", clean_link)
-                return True, "Anti-bot challenge received — treated as alive"
+        # Anti-bot / Cloudflare / DDoS challenge protection:
+        if any(pat in text for pat in ["Just a moment...", "cf-chl-", "challenge-running", "Enable JavaScript and cookies to continue", "Attention Required"]):
+            logger.warning("[LINK CHECK] Anti-bot challenge page detected for %s — skipping", clean_link)
+            return True, "Anti-bot challenge received — treated as alive"
 
-            # Verify it's actually Telegram web:
-            if "tgme_page" not in text and "tgme_head" not in text:
-                logger.warning("[LINK CHECK] Non-Telegram response format for %s — skipping", clean_link)
-                return True, "Non-standard page format — treated as alive"
+        # Verify it's actually Telegram web:
+        if "tgme_page" not in text and "tgme_head" not in text:
+            logger.warning("[LINK CHECK] Non-Telegram response format for %s — skipping", clean_link)
+            return True, "Non-standard page format — treated as alive"
 
-            # Genuine Telegram dead/banned indicators:
-            if "This channel can’t be displayed because it was blocked" in text:
-                return False, "Channel is blocked by Telegram"
+        # Genuine Telegram dead/banned indicators:
+        if "This channel can’t be displayed because it was blocked" in text:
+            return False, "Channel is blocked by Telegram"
 
-            if "Channel is inaccessible" in text:
-                return False, "Channel is inaccessible"
+        if "Channel is inaccessible" in text:
+            return False, "Channel is inaccessible"
 
-            # For invite links (t.me/+... or joinchat):
-            is_invite = "/+" in clean_link or "joinchat" in clean_link
-            if is_invite:
-                # If there's an action button with tg://join?invite= or Join Channel/Group, it's ACTIVE!
-                if "tg://join?invite=" in text or "tgme_action_button" in text or "tgme_page_action" in text:
-                    return True, "Active (Invite link valid)"
+        # For invite links (t.me/+... or joinchat):
+        is_invite = "/+" in clean_link or "joinchat" in clean_link
+        if is_invite:
+            # If there's an action button with tg://join?invite= or Join Channel/Group, it's ACTIVE!
+            if "tg://join?invite=" in text or "tgme_action_button" in text or "tgme_page_action" in text:
+                return True, "Active (Invite link valid)"
 
-                # If there's a title, subscriber count, or photo, it's ACTIVE!
-                if "tgme_page_title" in text or "tgme_page_extra" in text or "tgme_page_photo" in text:
-                    return True, "Active"
-
-                # If the page structure is present, it's a valid Telegram page
-                if "tgme_page" in text:
-                    return True, "Active (Telegram invite page)"
-
+            # If there's a title, subscriber count, or photo, it's ACTIVE!
+            if "tgme_page_title" in text or "tgme_page_extra" in text or "tgme_page_photo" in text:
                 return True, "Active"
-            else:
-                # Public channel/username
-                if "tgme_page_title" in text:
-                    return True, "Active"
-                if "tgme_page_icon" in text and "tgme_page_extra" not in text and "tgme_action_button" not in text:
-                    return False, "Channel username not found"
+
+            # If the page structure is present, it's a valid Telegram page
+            if "tgme_page" in text:
+                return True, "Active (Telegram invite page)"
+
+            return True, "Active"
+        else:
+            # Public channel/username
+            if "tgme_page_title" in text:
                 return True, "Active"
+            if "tgme_page_icon" in text and "tgme_page_extra" not in text and "tgme_action_button" not in text:
+                return False, "Channel username not found"
+            return True, "Active"
 
     except Exception as exc:
         logger.warning("[LINK CHECK] Network exception for %s: %s", clean_link, exc)
@@ -1316,7 +1392,6 @@ async def cmd_delpost(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         conn = db.get_connection(DB_PATH)
         conn.execute("DELETE FROM posts WHERE channel_msg_id = ?", (msg_id,))
         conn.commit()
-        conn.close()
         await update.message.reply_text(
             f"✅ <b>Successfully Deleted Post!</b>\n\n"
             f"• <b>Message ID:</b> <code>{msg_id}</code>\n"
@@ -1479,7 +1554,6 @@ async def cb_del_fwd_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         conn = db.get_connection(DB_PATH)
         conn.execute("DELETE FROM posts WHERE channel_msg_id = ?", (msg_id,))
         conn.commit()
-        conn.close()
         await query.edit_message_text(
             f"✅ <b>Successfully deleted post #{msg_id} from channel!</b>\n\n"
             f"• Channel ID: <code>{chat_id}</code>\n"
@@ -1540,23 +1614,23 @@ async def cb_check_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     await query.answer()
     ref_id = query.data.split(":")[1]
 
-    payment = db.get_payment_by_order(DB_PATH, ref_id)
+    payment = await asyncio.to_thread(db.get_payment_by_order, DB_PATH, ref_id)
     if not payment:
         await query.answer("❌ Payment reference not found.", show_alert=True)
         return
 
     if payment["status"] == "paid":
-        channel = db.get_channel(DB_PATH, payment["channel_id"])
+        channel = await db_get_channel(payment["channel_id"])
         await query.answer("✅ Payment verified! Delivering your link...", show_alert=True)
         if channel:
             await send_protected_channel_link(ctx.bot, query.from_user.id, channel)
         return
 
-    # Check live with Razorpay API
+    # Check live with Razorpay API in a worker thread so event loop never blocks
     try:
         client = rzp_client()
         if ref_id.startswith("qr_"):
-            payments_list = pay.fetch_qr_payments(client, ref_id)
+            payments_list = await asyncio.to_thread(pay.fetch_qr_payments, client, ref_id)
             if payments_list:
                 for item in payments_list:
                     if item.get("status") in ("captured", "authorized"):
@@ -1573,9 +1647,9 @@ async def cb_check_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
                         return
             await query.answer("⏳ Payment not detected yet. Please scan and pay with any UPI app.", show_alert=True)
         else:
-            order = pay.fetch_order(client, ref_id)
+            order = await asyncio.to_thread(pay.fetch_order, client, ref_id)
             if order.get("status") == "paid" or order.get("amount_paid", 0) >= order.get("amount", 1):
-                payments_list = pay.fetch_order_payments(client, ref_id)
+                payments_list = await asyncio.to_thread(pay.fetch_order_payments, client, ref_id)
                 payment_id = ""
                 method = "Instant Check"
                 if payments_list:
@@ -1602,6 +1676,7 @@ async def cb_check_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
 # In-memory QR cache: (user_id, channel_id) -> {"qr_id": ..., "qr_bytes": ..., "vpa": ..., "created_at": ...}
 QR_CACHE: dict[tuple[int, int], dict] = {}
+_QR_INFLIGHT_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
 
 # Tracks the QR payment photo message per user so it can be deleted after payment
 # user_id -> {"chat_id": int, "message_id": int}
@@ -1620,7 +1695,7 @@ def _blocking_get_or_create_qr(
     now = time.time()
     if key in QR_CACHE:
         cached = QR_CACHE[key]
-        if now - cached["created_at"] < 600:
+        if now - cached["created_at"] < 600 and cached.get("price") == price:
             return cached["qr_id"], cached["qr_bytes"], cached["vpa"]
 
     client = rzp_client()
@@ -1647,15 +1722,13 @@ def _blocking_get_or_create_qr(
     image_url = qr.get("image_url") or f"https://api.razorpay.com/v1/l/qrcode/{qr_id}"
 
     try:
-        qr_img_bytes = pay.download_and_crop_razorpay_qr(image_url)
+        qr_img_bytes = pay.download_and_crop_razorpay_qr(image_url, qr_id=qr_id)
     except Exception as exc:
         logger.error("Failed to download/crop Razorpay QR from %s: %s", image_url, exc)
         try:
-            import httpx
-            resp = httpx.get(image_url, follow_redirects=True, timeout=10.0)
-            qr_img_bytes = resp.content
-        except Exception:
             qr_img_bytes = pay.generate_clean_qr_image(f"upi://pay?am={price:.2f}&cu=INR")
+        except Exception:
+            qr_img_bytes = b""
 
     vpa = ""
 
@@ -1666,6 +1739,7 @@ def _blocking_get_or_create_qr(
         "qr_id": qr_id,
         "qr_bytes": qr_img_bytes,
         "vpa": vpa,
+        "price": price,
         "created_at": now,
     }
     return qr_id, qr_img_bytes, vpa
@@ -1674,16 +1748,61 @@ def _blocking_get_or_create_qr(
 async def get_or_create_qr_code(
     user_id: int, channel_id: int, price: float, channel_name: str, post_id: int | None = None
 ) -> tuple[str, bytes, str]:
-    """Async wrapper — runs blocking Razorpay/HTTP calls in a thread pool."""
-    return await asyncio.to_thread(
-        _blocking_get_or_create_qr, user_id, channel_id, price, channel_name, post_id
+    """Async wrapper — deduplicates concurrent requests per (user_id, channel_id) and runs in a thread pool."""
+    key = (user_id, channel_id)
+    now = time.time()
+    cached = QR_CACHE.get(key)
+    if cached and (now - cached["created_at"] < 600) and cached.get("price") == price:
+        return cached["qr_id"], cached["qr_bytes"], cached["vpa"]
+
+    lock = _QR_INFLIGHT_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _QR_INFLIGHT_LOCKS[key] = lock
+
+    async with lock:
+        now = time.time()
+        cached = QR_CACHE.get(key)
+        if cached and (now - cached["created_at"] < 600) and cached.get("price") == price:
+            return cached["qr_id"], cached["qr_bytes"], cached["vpa"]
+        return await asyncio.to_thread(
+            _blocking_get_or_create_qr, user_id, channel_id, price, channel_name, post_id
+        )
+
+
+def build_instant_payment_info(
+    channel_name: str,
+    price: float,
+    cross_price: float | None = None,
+    description: str | None = None,
+) -> str:
+    """Instant first message showing channel details, price, and payment instructions before QR generation."""
+    if cross_price and cross_price > price:
+        price_line = f"<b>💰 Offer Price:</b> <s>₹{cross_price:.0f}</s>  <b>₹{price:.0f}</b> <i>(Special Offer 🔥)</i>"
+    else:
+        price_line = f"<b>💰 Access Price:</b> <b>₹{price:.0f}</b> <i>(One-Time Fee)</i>"
+
+    desc_block = ""
+    if description:
+        desc_block = f"<b>📖 Details:</b> <i>{description}</i>\n"
+
+    return (
+        f"<blockquote><b>👑 {channel_name} — VIP ACCESS 👑</b></blockquote>\n"
+        f"<blockquote><b>🏷️ Channel:</b> <b>{channel_name}</b>\n"
+        f"{price_line}\n"
+        f"{desc_block}"
+        f"<b>⚡ Validity:</b> Lifetime Access • Instant Auto-Delivery\n"
+        f"<b>💳 Payment Mode:</b> All UPI Apps (GPay • PhonePe • Paytm • BHIM)</blockquote>\n"
+        f"<blockquote><b>📲 NEXT STEP:</b>\n"
+        f"⏳ <b>Generating your unique ₹{price:.0f} UPI QR Code below...</b>\n"
+        f"<i>Simply scan the QR code that appears next and your private invite link will be sent here automatically within 3–5 seconds! 🚀</i></blockquote>"
     )
 
 
 def build_qr_payment_caption(channel_name: str, price: float, qr_id: str) -> str:
     """Rich, engaging payment QR caption with clear instructions and advanced emojis."""
     return (
-        f"<blockquote><b>👑 PREMIUM VIP ACCESS PAYMENT 👑</b></blockquote>\n"
+        f"<blockquote><b>👑 SCAN & PAY FOR VIP ACCESS 👑</b></blockquote>\n"
         f"<blockquote><b>🏷️ Channel:</b> <b>{channel_name}</b>\n"
         f"<b>💵 Pay Amount:</b> <b>₹{price:.0f}</b> <i>(One-Time Fee)</i>\n"
         f"<b>🧾 Payment Ref ID:</b> <code>{qr_id}</code></blockquote>\n"
@@ -1698,6 +1817,63 @@ def build_qr_payment_caption(channel_name: str, price: float, qr_id: str) -> str
         f"🏆 Admin - {ADMIN_CONTACT}\n"
         f"💬 <b>Need help?</b> Share your Ref ID (<code>{qr_id}</code>) with Admin.</blockquote>"
     )
+
+
+async def _background_send_qr(
+    bot: Bot,
+    user_id: int,
+    chat_id: int,
+    channel_id: int,
+    channel_name: str,
+    price: float,
+    post_id: int | None = None,
+) -> None:
+    """Background task: generates QR code off the hot path and sends the QR photo immediately after the price message."""
+    try:
+        qr_id, qr_img_bytes, _ = await get_or_create_qr_code(
+            user_id, channel_id, price, channel_name, post_id=post_id
+        )
+    except Exception as exc:
+        logger.error("Background QR creation failed for user %d channel %d: %s", user_id, channel_id, exc)
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text="❌ Payment QR generation encountered a temporary delay. Please tap the buy button again.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+    caption_text = build_qr_payment_caption(channel_name, price, qr_id)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("« Browse All Channels", callback_data="back_menu")],
+    ])
+
+    bio = io.BytesIO(qr_img_bytes)
+    bio.name = "qr.png"
+    try:
+        qr_msg = await bot.send_photo(
+            chat_id=chat_id,
+            photo=bio,
+            caption=caption_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+        if qr_msg:
+            QR_MESSAGE_CACHE[user_id] = {
+                "chat_id": qr_msg.chat_id,
+                "message_id": qr_msg.message_id,
+            }
+            QR_MESSAGE_CACHE[qr_id] = {
+                "chat_id": qr_msg.chat_id,
+                "message_id": qr_msg.message_id,
+            }
+            await asyncio.to_thread(
+                db.store_qr_message_id, DB_PATH, qr_id, qr_msg.chat_id, qr_msg.message_id
+            )
+    except Exception as exc:
+        logger.error("Failed to send QR photo to user %d: %s", user_id, exc)
 
 
 async def handle_start_buy_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE, post_id: int) -> None:
@@ -1718,6 +1894,7 @@ async def handle_start_buy_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
         return
 
     price = post["price_inr"]
+    cross_price = row_get(post, "cross_price_inr")
 
     if already:
         await reply_or_send_text(
@@ -1732,82 +1909,46 @@ async def handle_start_buy_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
 
     # Check for free channel access — zero payment, direct link
     if price <= 0:
-        db.grant_free_access(DB_PATH, user.id, channel_id)
+        await asyncio.to_thread(db.grant_free_access, DB_PATH, user.id, channel_id)
         await send_protected_channel_link(ctx.bot, user.id, channel)
         return
 
-    # Show instant loading message
-    loading_msg = await reply_or_send_text(
-        update, ctx,
-        "⏳ <b>Generating your payment QR code...</b>\nPlease wait a moment."
+    # STEP 1: Immediately send the price & channel details message first (< 0.1s response)
+    info_text = build_instant_payment_info(
+        channel_name=channel["name"],
+        price=price,
+        cross_price=cross_price,
+        description=row_get(channel, "description"),
     )
+    await reply_or_send_text(update, ctx, info_text)
 
-    try:
-        qr_id, qr_img_bytes, vpa = await get_or_create_qr_code(
-            user.id, channel_id, price, channel["name"], post_id=post_id
+    # STEP 2: Generate and send the QR code right after in a background task
+    chat_id = update.effective_chat.id if update.effective_chat else user.id
+    asyncio.create_task(
+        _background_send_qr(
+            bot=ctx.bot,
+            user_id=user.id,
+            chat_id=chat_id,
+            channel_id=channel_id,
+            channel_name=channel["name"],
+            price=price,
+            post_id=post_id,
         )
-    except Exception as exc:
-        logger.error("QR creation failed for post %d: %s", post_id, exc)
-        if loading_msg:
-            try:
-                await loading_msg.delete()
-            except Exception:
-                pass
-        await reply_or_send_text(update, ctx, "❌ Payment system error. Please try again later.")
-        return
-
-    caption_text = build_qr_payment_caption(channel["name"], price, qr_id)
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("« Browse All Channels", callback_data="back_menu")],
-    ])
-
-    # Delete loading message and send QR
-    if loading_msg:
-        try:
-            await loading_msg.delete()
-        except Exception:
-            pass
-
-    bio = io.BytesIO(qr_img_bytes)
-    bio.name = "qr.png"
-    qr_msg = await reply_or_send_photo(
-        update, ctx,
-        photo=bio,
-        caption=caption_text,
-        reply_markup=keyboard,
     )
-    # Store the QR message so it can be deleted after payment
-    if qr_msg:
-        QR_MESSAGE_CACHE[user.id] = {
-            "chat_id": qr_msg.chat_id,
-            "message_id": qr_msg.message_id,
-        }
-        QR_MESSAGE_CACHE[qr_id] = {
-            "chat_id": qr_msg.chat_id,
-            "message_id": qr_msg.message_id,
-        }
-        try:
-            db.store_qr_message_id(DB_PATH, qr_id, qr_msg.chat_id, qr_msg.message_id)
-        except Exception:
-            pass
 
 
 async def handle_start_buy_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE, channel_id: int) -> None:
     """Handle direct channel purchase deep link."""
     user = update.effective_user
-    channel = db.get_channel(DB_PATH, channel_id)
-    if not channel or not channel["is_active"]:
-        await reply_or_send_text(update, ctx, "❌ This channel is currently unavailable.")
-        return
-
-    # Channel availability check
-    if not row_get(channel, "is_active", 1):
+    channel, already = await asyncio.gather(
+        db_get_channel(channel_id),
+        db_has_access(user.id, channel_id),
+    )
+    if not channel or not row_get(channel, "is_active", 1):
         await reply_or_send_text(update, ctx, "❌ This channel is currently unavailable.")
         return
 
     price = channel["price_inr"]
-    already = db.has_access(DB_PATH, user.id, channel_id)
 
     if already:
         await reply_or_send_text(
@@ -1822,66 +1963,30 @@ async def handle_start_buy_channel(update: Update, ctx: ContextTypes.DEFAULT_TYP
 
     # Check for free channel access — zero payment, direct link
     if price <= 0:
-        db.grant_free_access(DB_PATH, user.id, channel_id)
+        await asyncio.to_thread(db.grant_free_access, DB_PATH, user.id, channel_id)
         await send_protected_channel_link(ctx.bot, user.id, channel)
         return
 
-    # Show instant loading message
-    loading_msg = await reply_or_send_text(
-        update, ctx,
-        "⏳ <b>Generating your payment QR code...</b>\nPlease wait a moment."
+    # STEP 1: Immediately send the price & channel details message first (< 0.1s response)
+    info_text = build_instant_payment_info(
+        channel_name=channel["name"],
+        price=price,
+        description=row_get(channel, "description"),
     )
+    await reply_or_send_text(update, ctx, info_text)
 
-    try:
-        qr_id, qr_img_bytes, vpa = await get_or_create_qr_code(
-            user.id, channel_id, price, channel["name"]
+    # STEP 2: Generate and send the QR code right after in a background task
+    chat_id = update.effective_chat.id if update.effective_chat else user.id
+    asyncio.create_task(
+        _background_send_qr(
+            bot=ctx.bot,
+            user_id=user.id,
+            chat_id=chat_id,
+            channel_id=channel_id,
+            channel_name=channel["name"],
+            price=price,
         )
-    except Exception as exc:
-        logger.error("QR creation failed for channel %d: %s", channel_id, exc)
-        if loading_msg:
-            try:
-                await loading_msg.delete()
-            except Exception:
-                pass
-        await reply_or_send_text(update, ctx, "❌ Payment system error. Please try again later.")
-        return
-
-    caption_text = build_qr_payment_caption(channel["name"], price, qr_id)
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("« Browse All Channels", callback_data="back_menu")],
-    ])
-
-    # Delete loading message and send QR
-    if loading_msg:
-        try:
-            await loading_msg.delete()
-        except Exception:
-            pass
-
-    bio = io.BytesIO(qr_img_bytes)
-    bio.name = "qr.png"
-    qr_msg = await reply_or_send_photo(
-        update, ctx,
-        photo=bio,
-        caption=caption_text,
-        reply_markup=keyboard,
     )
-    # Store the QR message so it can be deleted after payment
-    if qr_msg:
-        QR_MESSAGE_CACHE[user.id] = {
-            "chat_id": qr_msg.chat_id,
-            "message_id": qr_msg.message_id,
-        }
-        QR_MESSAGE_CACHE[qr_id] = {
-            "chat_id": qr_msg.chat_id,
-            "message_id": qr_msg.message_id,
-        }
-        # Also persist to DB so deletion works after bot restarts
-        try:
-            db.store_qr_message_id(DB_PATH, qr_id, qr_msg.chat_id, qr_msg.message_id)
-        except Exception:
-            pass
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2136,28 +2241,26 @@ async def cb_buy_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     await query.answer()
     channel_id = int(query.data.split(":")[1])
     user_id = query.from_user.id
-    unjoined = await get_unjoined_mandatory_channels(ctx.bot, user_id)
+    unjoined, channel, already = await asyncio.gather(
+        get_unjoined_mandatory_channels(ctx.bot, user_id),
+        db_get_channel(channel_id),
+        db_has_access(user_id, channel_id),
+    )
     if unjoined:
         await send_mandatory_channels_prompt(query, ctx, unjoined, f"c_{channel_id}")
         return
 
-    channel = db.get_channel(DB_PATH, channel_id)
-    if not channel or not channel["is_active"]:
+    if not channel or not row_get(channel, "is_active", 1):
         await query.edit_message_text("❌ This channel is no longer available.")
         return
 
-    # Channel availability check
-    if not row_get(channel, "is_active", 1):
-        await query.edit_message_text("❌ This channel is no longer available.")
-        return
-
-    if db.has_access(DB_PATH, user_id, channel_id):
+    if already:
         await query.answer("✅ You already have access!", show_alert=True)
         return
 
     price = channel["price_inr"]
     if price <= 0:
-        db.grant_free_access(DB_PATH, user_id, channel_id)
+        await asyncio.to_thread(db.grant_free_access, DB_PATH, user_id, channel_id)
         await query.answer("🎉 Free access granted!", show_alert=True)
         try:
             await query.edit_message_text(
@@ -2170,60 +2273,32 @@ async def cb_buy_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await send_protected_channel_link(ctx.bot, user_id, channel)
         return
 
-    # Show instant loading feedback
+    # STEP 1: Immediately show price & channel payment details first
+    info_text = build_instant_payment_info(
+        channel_name=channel["name"],
+        price=price,
+        description=row_get(channel, "description"),
+    )
     try:
         await query.edit_message_text(
-            "⏳ <b>Generating your payment QR code...</b>\nPlease wait a moment.",
+            info_text,
             parse_mode=ParseMode.HTML,
         )
     except Exception:
         pass
 
-    try:
-        qr_id, qr_img_bytes, vpa = await get_or_create_qr_code(
-            user_id, channel_id, price, channel["name"]
+    # STEP 2: Generate and send QR code right after in a background task
+    chat_id = query.message.chat_id if query.message else user_id
+    asyncio.create_task(
+        _background_send_qr(
+            bot=ctx.bot,
+            user_id=user_id,
+            chat_id=chat_id,
+            channel_id=channel_id,
+            channel_name=channel["name"],
+            price=price,
         )
-    except Exception as exc:
-        logger.error("QR creation failed for cb_buy_channel %d: %s", channel_id, exc)
-        try:
-            await query.edit_message_text("❌ Payment system error. Please try again later.")
-        except Exception:
-            pass
-        return
-
-    caption_text = build_qr_payment_caption(channel["name"], price, qr_id)
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("« Back to Menu", callback_data="back_menu")],
-    ])
-
-    bio = io.BytesIO(qr_img_bytes)
-    bio.name = "qr.png"
-    qr_msg = await query.message.reply_photo(
-        photo=bio,
-        caption=caption_text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=keyboard,
     )
-    # Store the QR message so it can be deleted after payment
-    if qr_msg:
-        QR_MESSAGE_CACHE[user_id] = {
-            "chat_id": qr_msg.chat_id,
-            "message_id": qr_msg.message_id,
-        }
-        QR_MESSAGE_CACHE[qr_id] = {
-            "chat_id": qr_msg.chat_id,
-            "message_id": qr_msg.message_id,
-        }
-        # Also persist to DB so deletion works after bot restarts
-        try:
-            db.store_qr_message_id(DB_PATH, qr_id, qr_msg.chat_id, qr_msg.message_id)
-        except Exception:
-            pass
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
 
 
 async def cb_verify_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2271,7 +2346,7 @@ async def handle_verify_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
 
     try:
         client = rzp_client()
-        payment_data = pay.fetch_payment(client, payment_id)
+        payment_data = await asyncio.to_thread(pay.fetch_payment, client, payment_id)
         rzp_order_id = payment_data.get("order_id", "")
 
         if rzp_order_id != order_id:
@@ -2291,8 +2366,8 @@ async def handle_verify_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
             return VERIFY_ID
 
         # Grant access
-        db.confirm_payment(DB_PATH, order_id, payment_id)
-        channel = db.get_channel(DB_PATH, channel_id)
+        await asyncio.to_thread(db.confirm_payment, DB_PATH, order_id, payment_id)
+        channel = await db_get_channel(channel_id)
 
         await send_protected_channel_link(ctx.bot, user_id, channel)
         ctx.user_data.clear()
@@ -2712,7 +2787,6 @@ async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     rows = conn.execute(
         "SELECT * FROM users ORDER BY joined_at DESC LIMIT 20"
     ).fetchall()
-    conn.close()
 
     if not rows:
         await update.message.reply_text("No users yet.")
@@ -2782,7 +2856,7 @@ async def cmd_check_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     ref_id = args[0].strip()
-    payment = db.find_payment(DB_PATH, ref_id)
+    payment = await asyncio.to_thread(db.find_payment, DB_PATH, ref_id)
 
     live_status = "Unknown"
     live_amount = None
@@ -2793,7 +2867,7 @@ async def cmd_check_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     client = rzp_client()
     try:
         if ref_id.startswith("qr_"):
-            qr_payments = pay.fetch_qr_payments(client, ref_id)
+            qr_payments = await asyncio.to_thread(pay.fetch_qr_payments, client, ref_id)
             if qr_payments:
                 for item in qr_payments:
                     live_status = item.get("status", "unknown")
@@ -2808,7 +2882,7 @@ async def cmd_check_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
             else:
                 live_status = "Unpaid (No payment detected on gateway)"
         elif ref_id.startswith("pay_"):
-            p_data = pay.fetch_payment(client, ref_id)
+            p_data = await asyncio.to_thread(pay.fetch_payment, client, ref_id)
             live_status = p_data.get("status", "unknown")
             live_amount = (p_data.get("amount") or 0) / 100.0
             live_pay_id = p_data.get("id")
@@ -2817,10 +2891,10 @@ async def cmd_check_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
             if created_at:
                 paid_timestamp = datetime.fromtimestamp(created_at).strftime("%Y-%m-%d %H:%M:%S")
         else:
-            o_data = pay.fetch_order(client, ref_id)
+            o_data = await asyncio.to_thread(pay.fetch_order, client, ref_id)
             live_status = o_data.get("status", "unknown")
             live_amount = (o_data.get("amount_paid") or o_data.get("amount") or 0) / 100.0
-            o_payments = pay.fetch_order_payments(client, ref_id)
+            o_payments = await asyncio.to_thread(pay.fetch_order_payments, client, ref_id)
             if o_payments:
                 live_pay_id = o_payments[0].get("id")
                 live_method = o_payments[0].get("method")
@@ -2959,9 +3033,8 @@ async def cmd_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
     if update.effective_chat and update.effective_chat.type != "private":
         try:
-            bot_me = await ctx.bot.get_me()
             await update.message.reply_text(
-                f"⚠️ Please message @{bot_me.username} in a <b>private direct chat</b> to create and publish posts.",
+                f"⚠️ Please message @{BOT_USERNAME} in a <b>private direct chat</b> to create and publish posts.",
                 parse_mode=ParseMode.HTML
             )
         except Exception:
@@ -2985,7 +3058,7 @@ async def cmd_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         "📢 <b>Create Channel Broadcast Post</b>\n\n"
         "This wizard publishes an announcement to your <b>Main Channel</b> with an inline 'Get Instant Access' button.\n"
         "Subscribers tap the button, pay via UPI QR, and get instant access!\n\n"
-        "📸 <b>Step 1/4:</b> Send an <b>Image/Photo</b> for the post.\n"
+        "📸🎬 <b>Step 1/4:</b> Send a <b>Photo or Video</b> for the post.\n"
         "(Or type <code>skip</code> if you want a text-only announcement.)\n\n"
         "✨ <i>Post description and emojis will be generated automatically — no description needed!</i>\n"
         "Type /cancel anytime to abort.",
@@ -3021,7 +3094,7 @@ async def cmd_postfree(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         "🎁 <b>Create Free Channel Broadcast Post</b>\n\n"
         "This wizard publishes a <b>FREE Channel Announcement</b> to your <b>Main Channel</b>.\n"
         "Subscribers can join immediately with <b>zero payment</b>!\n\n"
-        "📸 <b>Step 1/3:</b> Send an <b>Image/Photo</b> for the post.\n"
+        "📸🎬 <b>Step 1/3:</b> Send a <b>Photo or Video</b> for the post.\n"
         "(Or type <code>skip</code> if you want a text-only announcement.)\n\n"
         "✨ <i>Post caption and formatting will be generated automatically — no price or description needed!</i>\n"
         "Type /cancel anytime to abort.",
@@ -3031,18 +3104,37 @@ async def cmd_postfree(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def post_get_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive photo or handle skip for broadcast post, then immediately prompt for channel."""
-    if update.message.photo:
-        ctx.user_data["post_photo"] = update.message.photo[-1].file_id
-        if update.message.caption:
-            ctx.user_data["post_text"] = update.message.caption_html or update.message.caption
-    elif update.message.text and update.message.text.strip().lower() in ("skip", "/skip"):
+    """Receive photo, video, animation, or handle skip for broadcast post, then immediately prompt for channel."""
+    msg = update.message
+    if msg.photo:
+        ctx.user_data["post_photo"] = msg.photo[-1].file_id
+        ctx.user_data["post_media_type"] = "photo"
+        if msg.caption:
+            ctx.user_data["post_text"] = msg.caption_html or msg.caption
+    elif msg.video:
+        ctx.user_data["post_photo"] = msg.video.file_id
+        ctx.user_data["post_media_type"] = "video"
+        if msg.caption:
+            ctx.user_data["post_text"] = msg.caption_html or msg.caption
+    elif msg.animation:
+        ctx.user_data["post_photo"] = msg.animation.file_id
+        ctx.user_data["post_media_type"] = "animation"
+        if msg.caption:
+            ctx.user_data["post_text"] = msg.caption_html or msg.caption
+    elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("video/"):
+        ctx.user_data["post_photo"] = msg.document.file_id
+        ctx.user_data["post_media_type"] = "video"
+        if msg.caption:
+            ctx.user_data["post_text"] = msg.caption_html or msg.caption
+    elif msg.text and msg.text.strip().lower() in ("skip", "/skip"):
         ctx.user_data["post_photo"] = None
-    elif update.message.text:
+        ctx.user_data["post_media_type"] = None
+    elif msg.text:
         ctx.user_data["post_photo"] = None
-        ctx.user_data["post_text"] = update.message.text_html or update.message.text
+        ctx.user_data["post_media_type"] = None
+        ctx.user_data["post_text"] = msg.text_html or msg.text
     else:
-        await update.message.reply_text("⚠️ Please send a photo or type <code>skip</code>.", parse_mode=ParseMode.HTML)
+        await msg.reply_text("⚠️ Please send a photo, video, or type <code>skip</code>.", parse_mode=ParseMode.HTML)
         return POST_PHOTO
 
     channels = get_active_channels_cached()
@@ -3366,7 +3458,8 @@ async def render_post_preview(message, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     channel = db.get_channel(DB_PATH, ctx.user_data["post_channel_id"])
     price = ctx.user_data["post_price"]
     photo_file_id = ctx.user_data.get("post_photo")
-    bot_me = await ctx.bot.get_me()
+    media_type = ctx.user_data.get("post_media_type", "photo")
+    bot_username = BOT_USERNAME
 
     is_free = ctx.user_data.get("is_free", False) or (price is not None and price <= 0)
     link_mode = ctx.user_data.get("free_link_mode", "direct")
@@ -3386,7 +3479,7 @@ async def render_post_preview(message, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         payment_mode_line = "⚡ <b>Instant Access:</b> Zero Payment • 100% Free Join"
         action_line = "👇 <b>Tap the button below to join for free:</b>"
 
-        btn_url = channel["link"] if link_mode == "direct" else f"https://t.me/{bot_me.username}?start=free_{channel['id']}"
+        btn_url = channel["link"] if link_mode == "direct" else f"https://t.me/{bot_username}?start=free_{channel['id']}"
         btn_label = "🚀 Join Free Channel Now 🔓" if link_mode == "direct" else "🎁 Claim Free Instant Access 🔓"
         preview_kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(btn_label, url=btn_url)]
@@ -3409,7 +3502,7 @@ async def render_post_preview(message, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         action_line = "👇 <b>Tap the button below to unlock instant VIP access:</b>"
 
         preview_kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"⚡ Unlock Instant Access — ₹{price:.0f} 🔓", url=f"https://t.me/{bot_me.username}?start=preview")]
+            [InlineKeyboardButton(f"⚡ Unlock Instant Access — ₹{price:.0f} 🔓", url=f"https://t.me/{bot_username}?start=preview")]
         ])
 
     preview_caption = (
@@ -3448,15 +3541,32 @@ async def render_post_preview(message, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
     if photo_file_id:
         try:
-            await ctx.bot.send_photo(
-                chat_id=chat_id,
-                photo=photo_file_id,
-                caption=preview_caption,
-                parse_mode=ParseMode.HTML,
-                reply_markup=preview_kb,
-            )
+            if media_type == "video":
+                await ctx.bot.send_video(
+                    chat_id=chat_id,
+                    video=photo_file_id,
+                    caption=preview_caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=preview_kb,
+                )
+            elif media_type == "animation":
+                await ctx.bot.send_animation(
+                    chat_id=chat_id,
+                    animation=photo_file_id,
+                    caption=preview_caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=preview_kb,
+                )
+            else:
+                await ctx.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=photo_file_id,
+                    caption=preview_caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=preview_kb,
+                )
         except Exception as exc:
-            logger.warning("Could not send preview photo, falling back to text: %s", exc)
+            logger.warning("Could not send preview media, falling back to text: %s", exc)
             await ctx.bot.send_message(
                 chat_id=chat_id,
                 text=preview_caption,
@@ -3498,6 +3608,7 @@ async def cb_post_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     channel_id = ctx.user_data.get("post_channel_id")
     price = ctx.user_data.get("post_price", 0.0)
     photo_file_id = ctx.user_data.get("post_photo")
+    media_type = ctx.user_data.get("post_media_type", "photo")
     final_caption = ctx.user_data.get("final_caption")
     cross_price = ctx.user_data.get("post_cross_price")
     is_free = ctx.user_data.get("is_free", False) or price <= 0
@@ -3522,14 +3633,14 @@ async def cb_post_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         cross_price_inr=cross_price,
     )
 
-    bot_me = await ctx.bot.get_me()
+    bot_username = BOT_USERNAME
     if is_free:
         if link_mode == "direct":
             btn_text = "🚀 Join Free Channel Now 🔓"
             btn_url = channel["link"]
         else:
             btn_text = "🎁 Claim Free Instant Access 🔓"
-            btn_url = f"https://t.me/{bot_me.username}?start=free_{post_id}"
+            btn_url = f"https://t.me/{bot_username}?start=free_{post_id}"
         channel_keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(btn_text, url=btn_url)]
         ])
@@ -3537,7 +3648,7 @@ async def cb_post_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         channel_keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(
                 f"⚡ Unlock Instant Access — ₹{price:.0f} 🔓",
-                url=f"https://t.me/{bot_me.username}?start=buy_{post_id}"
+                url=f"https://t.me/{bot_username}?start=buy_{post_id}"
             )]
         ])
 
@@ -3550,15 +3661,32 @@ async def cb_post_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
 
         if photo_file_id:
             try:
-                msg = await ctx.bot.send_photo(
-                    chat_id=target_chat_id,
-                    photo=photo_file_id,
-                    caption=final_caption,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=channel_keyboard,
-                )
+                if media_type == "video":
+                    msg = await ctx.bot.send_video(
+                        chat_id=target_chat_id,
+                        video=photo_file_id,
+                        caption=final_caption,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=channel_keyboard,
+                    )
+                elif media_type == "animation":
+                    msg = await ctx.bot.send_animation(
+                        chat_id=target_chat_id,
+                        animation=photo_file_id,
+                        caption=final_caption,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=channel_keyboard,
+                    )
+                else:
+                    msg = await ctx.bot.send_photo(
+                        chat_id=target_chat_id,
+                        photo=photo_file_id,
+                        caption=final_caption,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=channel_keyboard,
+                    )
             except Exception as photo_exc:
-                logger.warning("Failed to send photo to channel (%s), falling back to text: %s", photo_file_id, photo_exc)
+                logger.warning("Failed to send media to channel (%s), falling back to text: %s", photo_file_id, photo_exc)
                 msg = await ctx.bot.send_message(
                     chat_id=target_chat_id,
                     text=final_caption,
@@ -3576,7 +3704,7 @@ async def cb_post_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         db.update_post_msg_id(DB_PATH, post_id, msg.message_id)
 
         price_display = "FREE (₹0) 🎁" if is_free else f"₹{price:.0f}"
-        button_link_info = f"Direct Channel Link ({channel['link']})" if (is_free and link_mode == "direct") else f"https://t.me/{bot_me.username}?start={'free' if is_free else 'buy'}_{post_id}"
+        button_link_info = f"Direct Channel Link ({channel['link']})" if (is_free and link_mode == "direct") else f"https://t.me/{bot_username}?start={'free' if is_free else 'buy'}_{post_id}"
 
         await query.edit_message_text(
             f"🎉 <b>Post Successfully Published!</b>\n\n"
@@ -3714,12 +3842,12 @@ async def handle_chat_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYP
     user = join_req.from_user
     chat = join_req.chat
 
-    channel = db.get_channel_by_chat_id(DB_PATH, chat.id)
+    channel = await asyncio.to_thread(db.get_channel_by_chat_id, DB_PATH, chat.id)
     if not channel:
         logger.warning("Join request for unmanaged chat %s (%d)", chat.title, chat.id)
         return
 
-    if db.has_access(DB_PATH, user.id, channel["id"]):
+    if await db_has_access(user.id, channel["id"]):
         try:
             await join_req.approve()
             logger.info("Approved join request for user %d (%s) in chat %s (%d)", user.id, user.first_name, chat.title, chat.id)
@@ -3735,14 +3863,13 @@ async def handle_chat_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYP
         try:
             await join_req.decline()
             logger.warning("Declined unauthorized join request for user %d in chat %s (%d)", user.id, chat.title, chat.id)
-            bot_me = await ctx.bot.get_me()
             await ctx.bot.send_message(
                 chat_id=user.id,
                 text=(
                     f"🚫 <b>Access Denied to {chat.title}</b>\n\n"
                     f"You have not purchased access to this channel.\n"
                     f"If you received this link from someone else, note that links are non-transferable.\n\n"
-                    f"👉 To purchase valid access, visit @{bot_me.username}"
+                    f"👉 To purchase valid access, visit @{BOT_USERNAME}"
                 ),
                 parse_mode=ParseMode.HTML,
             )
@@ -3840,7 +3967,7 @@ async def post_shutdown(app: Application) -> None:
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log error and notify user/admin if possible."""
     err = context.error
-    if isinstance(err, (BadRequest, Forbidden)):
+    if isinstance(err, (BadRequest, Forbidden, TimedOut, NetworkError)):
         err_str = str(err).lower()
         if any(ign in err_str for ign in [
             "query is too old",
@@ -3853,6 +3980,7 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
             "bot was blocked by the user",
             "user is deactivated",
             "chat not found",
+            "timed out",
         ]):
             logger.debug("Harmless Telegram API condition ignored: %s", err)
             return
@@ -3884,10 +4012,28 @@ def main() -> None:
     db.init_db(DB_PATH)
     logger.info("Starting bot… Admins: %s", ADMIN_IDS)
 
+    # High-concurrency HTTPX connection pool for 5000+ user base
+    bot_request = HTTPXRequest(
+        connection_pool_size=64,
+        connect_timeout=20.0,
+        read_timeout=20.0,
+        write_timeout=20.0,
+        pool_timeout=30.0,
+    )
+    updates_request = HTTPXRequest(
+        connection_pool_size=4,
+        connect_timeout=20.0,
+        read_timeout=35.0,
+        write_timeout=20.0,
+        pool_timeout=30.0,
+    )
+
     app = (
         Application.builder()
         .token(BOT_TOKEN)
-        .concurrent_updates(True)
+        .concurrent_updates(64)
+        .request(bot_request)
+        .get_updates_request(updates_request)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
@@ -3919,7 +4065,10 @@ def main() -> None:
         ],
         states={
             POST_PHOTO: [
-                MessageHandler(filters.PHOTO, post_get_photo),
+                MessageHandler(
+                    filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.VIDEO,
+                    post_get_photo,
+                ),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, post_get_photo),
                 CommandHandler("skip", post_get_photo),
             ],
@@ -4033,7 +4182,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_view_channel,  pattern=r"^view:"))
     app.add_handler(CallbackQueryHandler(cb_get_link,      pattern=r"^getlink:"))
     app.add_handler(CallbackQueryHandler(cb_buy_channel,   pattern=r"^buy:"))
-    app.add_handler(CallbackQueryHandler(cb_check_payment, pattern=r"^check_pay:"))
+    app.add_handler(CallbackQueryHandler(cb_check_payment, pattern=r"^check_?pay:"))
     app.add_handler(CallbackQueryHandler(cb_adm_force_pay, pattern=r"^adm_force_pay:"))
     app.add_handler(CallbackQueryHandler(cb_del_channel,   pattern=r"^del_channel:"))
     app.add_handler(CallbackQueryHandler(cb_del_fwd_post,  pattern=r"^del_fwd_post:"))
@@ -4045,9 +4194,9 @@ def main() -> None:
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
-        read_timeout=10,
-        write_timeout=10,
-        connect_timeout=10,
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=20,
         pool_timeout=30,
     )
 
