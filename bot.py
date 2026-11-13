@@ -918,23 +918,24 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
             # For invite links (t.me/+... or joinchat):
             is_invite = "/+" in clean_link or "joinchat" in clean_link
             if is_invite:
-                has_title = "tgme_page_title" in text
-                has_extra = "tgme_page_extra" in text
-                has_photo = "tgme_page_photo" in text or "tgme_page_photo_image" in text
+                # If there's an action button with tg://join?invite= or Join Channel/Group, it's ACTIVE!
+                if "tg://join?invite=" in text or "tgme_action_button" in text or "tgme_page_action" in text:
+                    return True, "Active (Invite link valid)"
 
-                # On truly invalid/expired invite links, Telegram displays generic group icon
-                # with NO title, NO photo, and NO subscriber count.
-                is_generic_placeholder = ("tgme_page_icon" in text) and not has_title and not has_photo and not has_extra
+                # If there's a title, subscriber count, or photo, it's ACTIVE!
+                if "tgme_page_title" in text or "tgme_page_extra" in text or "tgme_page_photo" in text:
+                    return True, "Active"
 
-                if is_generic_placeholder:
-                    return False, "Channel link expired or channel banned"
+                # If the page structure is present, it's a valid Telegram page
+                if "tgme_page" in text:
+                    return True, "Active (Telegram invite page)"
 
                 return True, "Active"
             else:
                 # Public channel/username
                 if "tgme_page_title" in text:
                     return True, "Active"
-                if "tgme_page_icon" in text and "tgme_page_extra" not in text:
+                if "tgme_page_icon" in text and "tgme_page_extra" not in text and "tgme_action_button" not in text:
                     return False, "Channel username not found"
                 return True, "Active"
 
@@ -980,11 +981,13 @@ async def cleanup_dead_channel(bot, channel: dict, reason: str) -> int:
                     p["id"], msg_id, target
                 )
                 deleted_posts_count += 1
+                db.delete_post(DB_PATH, p["id"])
             except Exception as exc:
                 err_str = str(exc)
                 if "message to delete not found" in err_str.lower():
                     logger.info("Promotional post msg_id=%s was already deleted from %s", msg_id, target)
-                    post_notes.append(f"Msg #{msg_id} was already deleted")
+                    deleted_posts_count += 1
+                    db.delete_post(DB_PATH, p["id"])
                 else:
                     logger.warning(
                         "Could not delete message %s from %s for post %d: %s",
@@ -994,8 +997,6 @@ async def cleanup_dead_channel(bot, channel: dict, reason: str) -> int:
 
     # 3. Soft-deactivate channel in database — PRESERVES all user access & sales records!
     db.deactivate_channel(DB_PATH, channel_id)
-    # Remove promotional post rows from DB
-    db.delete_posts_for_channel(DB_PATH, channel_id)
     logger.info("Soft-deactivated dead channel #%d (%s) in database (user access preserved).", channel_id, channel_name)
 
     # 4. Invalidate QR cache
@@ -1007,9 +1008,14 @@ async def cleanup_dead_channel(bot, channel: dict, reason: str) -> int:
     if deleted_posts_count > 0:
         cleanup_status = f"✅ Deleted <b>{deleted_posts_count}</b> post(s) from main channel"
     elif post_notes:
-        cleanup_status = f"⚠️ Post deletion note: " + "; ".join(post_notes)
+        cleanup_status = f"⚠️ Could not delete message from channel:\n" + "\n".join(f"• {n}" for n in post_notes)
     else:
-        cleanup_status = f"ℹ️ No promotional posts were registered in DB for this channel"
+        cleanup_status = (
+            "ℹ️ <b>No promotional posts found in database for this channel.</b>\n"
+            "💡 <i>To delete an existing post from the channel manually:</i>\n"
+            "• Use <code>/delpost [message_id_or_link]</code>\n"
+            "• Or simply <b>forward the channel post to this bot</b> in private chat to delete it with one tap!"
+        )
 
     alert_msg = (
         f"🚨 <b>Channel Link Monitor Alert</b> 🚨\n\n"
@@ -1041,68 +1047,110 @@ async def cleanup_dead_channel(bot, channel: dict, reason: str) -> int:
 async def channel_link_monitor_worker(bot) -> None:
     """
     Background worker periodically monitoring all active channels.
-    Requires 5 consecutive check cycles of failure (~25 minutes) before deactivation,
-    and includes a circuit breaker to halt if multiple channels fail simultaneously.
+
+    Safety rules:
+    1. CIRCUIT BREAKER: If ANY 2+ channels fail in the same cycle -> suspected network/rate-limit
+       outage. All fail counters are FULLY RESET to 0 (not just decremented). No cleanup runs.
+    2. FAIL THRESHOLD: A single channel must fail FAIL_THRESHOLD consecutive cycles to be deactivated.
+    3. RECOVERY: A single successful check resets that channel's fail counter to 0.
+    4. MIDNIGHT PROTECTION: Skips all checks between 00:30-01:30 local time (Telegram maintenance window).
+    5. CHAT_ID PRIORITY: If a channel has a chat_id set, uses authoritative Telegram Bot API
+       (never web scraping) - false positives are impossible via Bot API.
     """
     logger.info("Channel link monitor worker started.")
     check_interval = int(os.getenv("CHANNEL_MONITOR_INTERVAL_SECONDS", "300"))
-    FAIL_THRESHOLD = 5
+    FAIL_THRESHOLD = int(os.getenv("CHANNEL_FAIL_THRESHOLD", "7"))  # ~35 min of persistent failures
 
-    await asyncio.sleep(20)
+    await asyncio.sleep(30)
 
     while True:
         try:
+            # ---- MIDNIGHT PROTECTION -----------------------------------------
+            # Telegram's t.me web pages are frequently rate-limited or return
+            # challenge pages between midnight and 01:30. Skip checks in this window.
+            now_dt = datetime.now()
+            now_hour = now_dt.hour
+            now_minute = now_dt.minute
+            if (now_hour == 0 and now_minute >= 30) or now_hour == 1:
+                logger.info("[LINK MONITOR] Skipping check during midnight maintenance window (00:30-01:59).")
+                await asyncio.sleep(check_interval)
+                continue
+
             channels = db.get_active_channels(DB_PATH)
             if not channels:
                 await asyncio.sleep(check_interval)
                 continue
 
             failed_this_cycle = []
+            passed_this_cycle = []
 
             for ch in channels:
                 cid = ch["id"]
                 link = ch["link"]
                 chat_id = row_get(ch, "chat_id")
 
-                # Small delay between checks to prevent bursting requests to Telegram
-                await asyncio.sleep(2)
+                # Stagger requests to avoid rate limits
+                await asyncio.sleep(3)
 
                 is_alive, reason = await check_channel_link_alive(link, bot=bot, chat_id=chat_id)
                 if not is_alive:
                     failed_this_cycle.append((ch, reason))
                     _channel_consecutive_failures[cid] = _channel_consecutive_failures.get(cid, 0) + 1
                     logger.warning(
-                        "Channel #%d (%s) failed check (%d/%d): %s",
+                        "[LINK MONITOR] Channel #%d (%s) failed check (%d/%d): %s",
                         cid, ch["name"], _channel_consecutive_failures[cid], FAIL_THRESHOLD, reason
                     )
                 else:
-                    if cid in _channel_consecutive_failures:
-                        _channel_consecutive_failures[cid] = 0
+                    passed_this_cycle.append(ch)
+                    if cid in _channel_consecutive_failures and _channel_consecutive_failures[cid] > 0:
+                        logger.info("[LINK MONITOR] Channel #%d (%s) recovered -- resetting fail count.", cid, ch["name"])
+                    _channel_consecutive_failures[cid] = 0
 
-            # ── CIRCUIT BREAKER ──────────────────────────────────────────────
+            # ---- CIRCUIT BREAKER ---------------------------------------------
             # If 2 or more channels failed in the SAME cycle, this is almost certainly
-            # a network outage, Telegram rate limit, or IP block — NOT all channels dying!
+            # a network outage, Telegram rate limit, or IP block -- NOT all channels dying!
             if len(failed_this_cycle) >= 2:
                 logger.error(
-                    "🚨 [CIRCUIT BREAKER TRIGGERED] %d channels failed check simultaneously in this cycle! "
-                    "Suspected Telegram rate-limit or network outage. Halting cleanup to protect database.",
-                    len(failed_this_cycle)
+                    "[CIRCUIT BREAKER TRIGGERED] %d/%d channels failed in one cycle! "
+                    "Suspected Telegram rate-limit or network outage. "
+                    "FULLY RESETTING all fail counters -- no cleanup will run.",
+                    len(failed_this_cycle), len(channels)
                 )
-                # Decrement counts so a transient network block doesn't accumulate to threshold
+                # Fully reset ALL fail counters -- a mass failure is never genuine
                 for ch, _ in failed_this_cycle:
-                    cid = ch["id"]
-                    _channel_consecutive_failures[cid] = max(0, _channel_consecutive_failures.get(cid, 0) - 1)
+                    _channel_consecutive_failures[ch["id"]] = 0
+                # Notify admin of the outage (but DO NOT deactivate anything)
+                for admin_id in ADMIN_IDS:
+                    try:
+                        names = ", ".join(ch["name"] for ch, _ in failed_this_cycle)
+                        await bot.send_message(
+                            chat_id=admin_id,
+                            text=(
+                                "<b>Link Monitor: Network Outage Detected</b>\n\n"
+                                f"<b>{len(failed_this_cycle)}</b> channels failed health check simultaneously "
+                                "-- this is a Telegram rate-limit or IP block, NOT a real channel issue.\n\n"
+                                f"<b>Channels affected:</b> {names}\n\n"
+                                "<i>No channels were deactivated. All fail counters reset.</i>"
+                            ),
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
             else:
-                # Process genuinely dead channels that exceeded the threshold
+                # Only 0 or 1 channel failed this cycle -- could be a genuine dead channel
                 for ch in channels:
                     cid = ch["id"]
                     if _channel_consecutive_failures.get(cid, 0) >= FAIL_THRESHOLD:
                         logger.error(
-                            "Channel #%d (%s) confirmed dead after %d consecutive check cycles! Initiating safe deactivation...",
+                            "[LINK MONITOR] Channel #%d (%s) confirmed dead after %d consecutive cycles. "
+                            "Initiating safe deactivation...",
                             cid, ch["name"], FAIL_THRESHOLD
                         )
                         _channel_consecutive_failures[cid] = 0
-                        await cleanup_dead_channel(bot, dict(ch), f"Persistent failure across {FAIL_THRESHOLD} consecutive checks (~25 mins)")
+                        await cleanup_dead_channel(
+                            bot, dict(ch),
+                            f"Persistent failure across {FAIL_THRESHOLD} consecutive single-channel checks (~{FAIL_THRESHOLD * check_interval // 60} min)"
+                        )
 
             await asyncio.sleep(check_interval)
         except asyncio.CancelledError:
@@ -1110,31 +1158,53 @@ async def channel_link_monitor_worker(bot) -> None:
         except Exception as exc:
             logger.error("Error in channel_link_monitor_worker: %s", exc)
             await asyncio.sleep(60)
-
-
 async def cmd_delpost(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin command: /delpost <message_id> to delete a specific post from the main channel."""
+    """Admin command: /delpost <message_id_or_link> to delete a specific post from the channel."""
     if not is_admin(update.effective_user.id):
         return
     args = ctx.args or []
     if not args:
         await update.message.reply_text(
-            "<b>Usage:</b> <code>/delpost &lt;message_id&gt; [channel_id]</code>\n\n"
-            "Deletes a promotional post from the main channel by its Telegram message ID.\n"
-            "• Example: <code>/delpost 1234</code>",
+            "<b>Usage:</b> <code>/delpost &lt;message_id_or_link&gt; [channel_id]</code>\n\n"
+            "Deletes a promotional post from the channel.\n"
+            "• <b>Examples:</b>\n"
+            "  <code>/delpost 1234</code>\n"
+            "  <code>/delpost https://t.me/c/1234567890/456</code>\n"
+            "  <code>/delpost https://t.me/mychannel/456</code>\n\n"
+            "💡 <i>Tip: You can also simply forward any channel post to this bot in private chat to delete it with one tap!</i>",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    try:
-        msg_id = int(args[0])
-    except ValueError:
-        await update.message.reply_text("⚠️ Message ID must be a number.")
-        return
+    raw_input = args[0].strip()
+    target = args[1].strip() if len(args) > 1 else None
+    msg_id = None
 
-    target = args[1] if len(args) > 1 else (db.get_setting(DB_PATH, "main_channel_id") or MAIN_CHANNEL_ID)
+    # Parse link formats: https://t.me/c/1234567890/456 or https://t.me/mychannel/456
+    if "t.me/" in raw_input:
+        clean = raw_input.rstrip("/")
+        parts = clean.split("/")
+        if len(parts) >= 2 and parts[-1].isdigit():
+            msg_id = int(parts[-1])
+            channel_part = parts[-2]
+            if channel_part.startswith("c"):
+                # Private channel link t.me/c/1234567890/456 -> -1001234567890
+                cid_num = channel_part[1:]
+                if cid_num.isdigit():
+                    target = f"-100{cid_num}"
+            else:
+                target = f"@{channel_part.lstrip('@')}"
+    else:
+        try:
+            msg_id = int(raw_input)
+        except ValueError:
+            await update.message.reply_text("⚠️ Message ID must be a number or a valid Telegram post link.")
+            return
+
     if not target:
-        await update.message.reply_text("❌ No target channel configured. Provide channel as second argument.")
+        target = db.get_setting(DB_PATH, "main_channel_id") or MAIN_CHANNEL_ID
+    if not target:
+        await update.message.reply_text("❌ No target channel configured. Provide channel ID/username as second argument.")
         return
 
     try:
@@ -1148,9 +1218,20 @@ async def cmd_delpost(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         conn.execute("DELETE FROM posts WHERE channel_msg_id = ?", (msg_id,))
         conn.commit()
         conn.close()
-        await update.message.reply_text(f"✅ Deleted message <code>{msg_id}</code> from <code>{target}</code>.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            f"✅ <b>Successfully Deleted Post!</b>\n\n"
+            f"• <b>Message ID:</b> <code>{msg_id}</code>\n"
+            f"• <b>Channel:</b> <code>{target}</code>",
+            parse_mode=ParseMode.HTML,
+        )
     except Exception as exc:
-        await update.message.reply_text(f"❌ Could not delete message <code>{msg_id}</code>: {exc}", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            f"❌ <b>Could not delete message:</b> {exc}\n\n"
+            f"• Target: <code>{target}</code>\n"
+            f"• Message ID: <code>{msg_id}</code>\n"
+            f"⚠️ <i>Check if the bot is Administrator in that channel with 'Delete Messages' permission!</i>",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 async def cmd_checklinks(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1238,7 +1319,7 @@ async def cmd_setchatid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_admin_forward(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Detect forwarded messages from channels to easily link Chat ID."""
+    """Detect forwarded messages from channels to delete post or link Chat ID."""
     msg = update.effective_message
     user = update.effective_user
     if not user or not is_admin(user.id) or not msg:
@@ -1246,18 +1327,71 @@ async def handle_admin_forward(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
     forward_chat = msg.forward_from_chat
     if forward_chat and forward_chat.type in ("channel", "supergroup"):
         chat_id = forward_chat.id
-        title = forward_chat.title or "Private Channel"
+        title = forward_chat.title or "Channel"
+        fwd_msg_id = msg.forward_from_message_id
+
+        buttons = []
+        if fwd_msg_id:
+            buttons.append([
+                InlineKeyboardButton(f"🗑️ Delete this Post #{fwd_msg_id} from Channel Now", callback_data=f"del_fwd_post:{chat_id}:{fwd_msg_id}")
+            ])
+
         channels = db.get_active_channels(DB_PATH)
-        buttons = [
-            [InlineKeyboardButton(f"🛡️ Link to {c['name']} (ID #{c['id']})", callback_data=f"link_cid:{c['id']}:{chat_id}")]
-            for c in channels
+        for c in channels:
+            buttons.append([
+                InlineKeyboardButton(f"🛡️ Link Chat ID to {c['name']} (ID #{c['id']})", callback_data=f"link_cid:{c['id']}:{chat_id}")
+            ])
+
+        info_lines = [
+            f"📢 <b>Forwarded Channel Post Detected!</b>\n",
+            f"• <b>Channel:</b> <b>{title}</b>",
+            f"• <b>Chat ID:</b> <code>{chat_id}</code>",
         ]
+        if fwd_msg_id:
+            info_lines.append(f"• <b>Message ID:</b> <code>{fwd_msg_id}</code>")
+
+        info_lines.append("\n<b>Choose an action:</b>")
         await msg.reply_text(
-            f"📢 <b>Detected Channel:</b> <b>{title}</b>\n"
-            f"🆔 <b>Chat ID:</b> <code>{chat_id}</code>\n\n"
-            f"Tap below to attach this Chat ID to a channel to enable <b>Anti-Leak Protection</b> (blocks preview & link sharing):",
+            "\n".join(info_lines),
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
+        )
+
+
+async def cb_del_fwd_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """One-click delete post from channel callback."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return
+    parts = query.data.split(":")
+    if len(parts) < 3:
+        return
+    chat_id = parts[1]
+    msg_id = int(parts[2])
+
+    try:
+        try:
+            target_chat_id = int(chat_id)
+        except (ValueError, TypeError):
+            target_chat_id = chat_id
+        await ctx.bot.delete_message(chat_id=target_chat_id, message_id=msg_id)
+        # Also clean up from DB if found
+        conn = db.get_connection(DB_PATH)
+        conn.execute("DELETE FROM posts WHERE channel_msg_id = ?", (msg_id,))
+        conn.commit()
+        conn.close()
+        await query.edit_message_text(
+            f"✅ <b>Successfully deleted post #{msg_id} from channel!</b>\n\n"
+            f"• Channel ID: <code>{chat_id}</code>\n"
+            f"• Message ID: <code>{msg_id}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as exc:
+        await query.edit_message_text(
+            f"❌ <b>Could not delete message #{msg_id}:</b> {exc}\n\n"
+            f"⚠️ <i>Make sure this bot is promoted to <b>Administrator</b> in that channel with 'Delete Messages' permission!</i>",
+            parse_mode=ParseMode.HTML,
         )
 
 
@@ -1481,12 +1615,9 @@ async def handle_start_buy_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
         await reply_or_send_text(update, ctx, "❌ This channel is currently unavailable.")
         return
 
-    # Check if channel is still alive
-    is_alive, reason = await check_channel_link_alive(channel["link"], bot=ctx.bot, chat_id=row_get(channel, "chat_id"))
-    if not is_alive:
-        logger.warning("Channel #%d is dead on user buy_post click. Cleaning up...", channel_id)
-        await cleanup_dead_channel(ctx.bot, dict(channel), reason)
-        await reply_or_send_text(update, ctx, "❌ This channel offer is no longer available. Use /menu to see all channels.")
+    # Channel availability check
+    if not channel.get("is_active", 1):
+        await reply_or_send_text(update, ctx, "❌ This channel is currently unavailable. Use /menu to see all channels.")
         return
 
     price = post["price_inr"]
@@ -1574,11 +1705,8 @@ async def handle_start_buy_channel(update: Update, ctx: ContextTypes.DEFAULT_TYP
         await reply_or_send_text(update, ctx, "❌ This channel is currently unavailable.")
         return
 
-    # Check if channel is still alive
-    is_alive, reason = await check_channel_link_alive(channel["link"], bot=ctx.bot, chat_id=row_get(channel, "chat_id"))
-    if not is_alive:
-        logger.warning("Channel #%d is dead on user buy_channel click. Cleaning up...", channel_id)
-        await cleanup_dead_channel(ctx.bot, dict(channel), reason)
+    # Channel availability check
+    if not channel.get("is_active", 1):
         await reply_or_send_text(update, ctx, "❌ This channel is currently unavailable.")
         return
 
@@ -1930,11 +2058,8 @@ async def cb_buy_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await query.edit_message_text("❌ This channel is no longer available.")
         return
 
-    # Check if channel is still alive
-    is_alive, reason = await check_channel_link_alive(channel["link"], bot=ctx.bot, chat_id=row_get(channel, "chat_id"))
-    if not is_alive:
-        logger.warning("Channel #%d is dead on user callback buy click. Cleaning up...", channel_id)
-        await cleanup_dead_channel(ctx.bot, dict(channel), reason)
+    # Channel availability check
+    if not channel.get("is_active", 1):
         await query.edit_message_text("❌ This channel is no longer available.")
         return
 
@@ -3821,6 +3946,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_check_payment, pattern=r"^check_pay:"))
     app.add_handler(CallbackQueryHandler(cb_adm_force_pay, pattern=r"^adm_force_pay:"))
     app.add_handler(CallbackQueryHandler(cb_del_channel,   pattern=r"^del_channel:"))
+    app.add_handler(CallbackQueryHandler(cb_del_fwd_post,  pattern=r"^del_fwd_post:"))
     app.add_handler(CallbackQueryHandler(cb_link_chatid,   pattern=r"^link_cid:"))
     app.add_handler(CallbackQueryHandler(cb_back_menu,     pattern=r"^back_menu$"))
     app.add_handler(CallbackQueryHandler(cb_guide_help,    pattern=r"^guide_help$"))
