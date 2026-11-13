@@ -1693,7 +1693,7 @@ async def handle_start_buy_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
         return
 
     # Channel availability check
-    if not channel.get("is_active", 1):
+    if not row_get(channel, "is_active", 1):
         await reply_or_send_text(update, ctx, "❌ This channel is currently unavailable. Use /menu to see all channels.")
         return
 
@@ -1783,7 +1783,7 @@ async def handle_start_buy_channel(update: Update, ctx: ContextTypes.DEFAULT_TYP
         return
 
     # Channel availability check
-    if not channel.get("is_active", 1):
+    if not row_get(channel, "is_active", 1):
         await reply_or_send_text(update, ctx, "❌ This channel is currently unavailable.")
         return
 
@@ -2136,7 +2136,7 @@ async def cb_buy_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     # Channel availability check
-    if not channel.get("is_active", 1):
+    if not row_get(channel, "is_active", 1):
         await query.edit_message_text("❌ This channel is no longer available.")
         return
 
