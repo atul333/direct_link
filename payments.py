@@ -67,115 +67,113 @@ def download_and_crop_razorpay_qr(image_url: str) -> bytes:
     Download the Razorpay QR image and crop to JUST the QR code — boundary to boundary.
     No BHIM/UPI logos, no text, no payment app icons, no background.
 
-    Uses pixel-density scanning to isolate the QR module grid within the white card.
+    1. First attempts to decode the UPI URI payload with cv2.QRCodeDetector.
+       If decoded, regenerates a clean, crisp, high-resolution QR image with zero raster artifacts.
+    2. If not decoded, locates the exact QR matrix bounding box using OpenCV detector points
+       or NumPy black/white transition-frequency analysis (finding the square QR block).
+    3. Crops the image cleanly to the QR code boundaries with a clean quiet-zone margin.
     """
     import httpx
     from PIL import Image
     import numpy as np
 
-    resp = httpx.get(image_url, follow_redirects=True, timeout=15.0)
-    resp.raise_for_status()
+    if isinstance(image_url, str) and (image_url.startswith("http://") or image_url.startswith("https://")):
+        resp = httpx.get(image_url, follow_redirects=True, timeout=15.0)
+        resp.raise_for_status()
+        raw_bytes = resp.content
+    elif isinstance(image_url, bytes):
+        raw_bytes = image_url
+    else:
+        with open(image_url, "rb") as f:
+            raw_bytes = f.read()
 
-    img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+    # Step 1: Attempt to decode the UPI payment payload directly with OpenCV
+    pts = None
+    try:
+        import cv2
+        np_arr = np.frombuffer(raw_bytes, np.uint8)
+        cv_img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if cv_img is not None:
+            detector = cv2.QRCodeDetector()
+            val, pts, _ = detector.detectAndDecode(cv_img)
+            if val and ("upi://" in val or "pa=" in val):
+                logger.info("Successfully decoded UPI payload from QR poster: %s...", val[:40])
+                return generate_clean_qr_image(val)
+    except Exception as exc:
+        logger.warning("cv2 QR decode failed or cv2 not available: %s", exc)
+        pts = None
+
+    # Step 2: Crop to exact QR bounding box
+    img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     w, h = img.size
 
+    crop_box = None
     try:
-        arr = np.array(img)
-        # Grayscale (fast weighted sum)
-        gray = (0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]).astype(np.float32)
+        # Check if cv2 detector found the corner points
+        if pts is not None and len(pts) > 0:
+            p = pts[0]
+            x0 = int(min(pt[0] for pt in p))
+            y0 = int(min(pt[1] for pt in p))
+            x1 = int(max(pt[0] for pt in p))
+            y1 = int(max(pt[1] for pt in p))
+            if (x1 - x0) > 40 and (y1 - y0) > 40:
+                crop_box = (x0, y0, x1, y1)
+                logger.info("Located QR bbox via OpenCV pts: %s", crop_box)
 
-        # ── Step 1: Find the white card boundaries ────────────────────────────
-        # The white card has a solid bright interior. Scan horizontal lines
-        # across the full width to find where rows are uniformly bright.
-        # Use the center 50% of width to avoid colored side panels.
-        mid_left  = int(w * 0.25)
-        mid_right = int(w * 0.75)
-        mid_strip = gray[:, mid_left:mid_right]   # (h, mid_w)
-        mid_w = mid_right - mid_left
+        # If not, use NumPy transition-frequency scan
+        if not crop_box:
+            gray = np.array(img.convert("L"))
+            binary = (gray < 128).astype(np.int8)
+            center_bin = binary[:, int(w * 0.15):int(w * 0.85)]
+            h_trans = np.sum(np.abs(np.diff(center_bin, axis=1)), axis=1)
+            qr_rows = np.where(h_trans >= 12)[0]
+            if len(qr_rows) > 30:
+                gaps = np.where(np.diff(qr_rows) > 5)[0]
+                segs = np.split(qr_rows, gaps + 1)
+                longest_row = max(segs, key=len)
+                y0, y1 = int(longest_row[0]), int(longest_row[-1])
 
-        # A "card row" is one where >80% of mid-strip pixels are bright white (>230)
-        bright_count = np.sum(mid_strip > 230, axis=1)
-        is_card_row  = bright_count > (mid_w * 0.80)
+                qr_band = binary[y0:y1, :]
+                v_trans = np.sum(np.abs(np.diff(qr_band, axis=0)), axis=0)
+                qr_cols = np.where(v_trans >= 12)[0]
+                if len(qr_cols) > 30:
+                    gaps_c = np.where(np.diff(qr_cols) > 5)[0]
+                    segs_c = np.split(qr_cols, gaps_c + 1)
+                    longest_col = max(segs_c, key=len)
+                    x0, x1 = int(longest_col[0]), int(longest_col[-1])
+                    crop_box = (x0, y0, x1, y1)
+                    logger.info("Located QR bbox via transition analysis: %s", crop_box)
 
-        # Find runs of card rows; take the longest run (= the main white card)
-        card_indices = np.where(is_card_row)[0]
-
-        if len(card_indices) > 30:
-            # Find the longest consecutive run of card rows
-            gaps = np.where(np.diff(card_indices) > 5)[0]
-            segments = np.split(card_indices, gaps + 1)
-            longest  = max(segments, key=len)
-            card_top    = int(longest[0])
-            card_bottom = int(longest[-1])
-        else:
-            card_top    = int(h * 0.22)
-            card_bottom = int(h * 0.85)
-
-        # ── Step 2: Within the card, find the QR zone ────────────────────────
-        # The QR code has rows with many dark pixels (black modules on white).
-        # "SCAN & PAY" text and BHIM/UPI logos also have some dark pixels but
-        # far fewer per row. We look for rows with high dark-pixel density.
-
-        card_strip   = gray[card_top:card_bottom, mid_left:mid_right]  # card interior
-        dark_per_row = np.sum(card_strip < 60, axis=1)   # strict black only
-
-        # QR rows have significantly more dark pixels than text rows.
-        # Threshold: >8% of mid-strip width is dark
-        qr_row_mask = dark_per_row > (mid_w * 0.08)
-        qr_rel_rows = np.where(qr_row_mask)[0]
-
-        if len(qr_rel_rows) > 30:
-            # Take the largest consecutive block (= QR code body)
-            gaps2    = np.where(np.diff(qr_rel_rows) > 10)[0]
-            segs2    = np.split(qr_rel_rows, gaps2 + 1)
-            qr_block = max(segs2, key=len)
-            qr_top    = card_top + int(qr_block[0])
-            qr_bottom = card_top + int(qr_block[-1])
-        else:
-            # Fallback: empirical — QR spans ~40%–64% of image height
-            qr_top    = int(h * 0.40)
-            qr_bottom = int(h * 0.64)
-
-        # ── Step 3: Find horizontal QR boundaries ────────────────────────────
-        qr_band      = gray[qr_top:qr_bottom, :]
-        dark_per_col = np.sum(qr_band < 60, axis=0)
-        qr_h_span    = qr_bottom - qr_top
-        qr_col_mask  = dark_per_col > (qr_h_span * 0.04)
-        qr_cols      = np.where(qr_col_mask)[0]
-
-        if len(qr_cols) > 20:
-            qr_left  = int(qr_cols[0])
-            qr_right = int(qr_cols[-1])
-        else:
-            qr_left  = int(w * 0.13)
-            qr_right = int(w * 0.87)
-
-        # ── Tiny padding (1%) so finder pattern corners aren't cut ───────────
-        pad_h = max(3, int((qr_bottom - qr_top) * 0.01))
-        pad_w = max(3, int((qr_right  - qr_left) * 0.01))
-
-        crop_box = (
-            max(0, qr_left  - pad_w),
-            max(0, qr_top   - pad_h),
-            min(w, qr_right + pad_w),
-            min(h, qr_bottom + pad_h),
-        )
-        logger.info(
-            "QR crop: %dx%d → card [%d–%d] → qr rows [%d–%d] cols [%d–%d] box=%s",
-            w, h, card_top, card_bottom, qr_top, qr_bottom, qr_left, qr_right, crop_box,
-        )
+        if crop_box:
+            x0, y0, x1, y1 = crop_box
+            qr_w, qr_h = x1 - x0, y1 - y0
+            # Clean quiet-zone padding (~4% of QR dimension, min 10px)
+            pad_x = max(10, int(qr_w * 0.04))
+            pad_y = max(10, int(qr_h * 0.04))
+            final_box = (
+                max(0, x0 - pad_x),
+                max(0, y0 - pad_y),
+                min(w, x1 + pad_x),
+                min(h, y1 + pad_y),
+            )
+            logger.info("Final QR crop box: %s (original %dx%d)", final_box, w, h)
+            cropped = img.crop(final_box)
+            buf = io.BytesIO()
+            cropped.save(buf, format="PNG")
+            buf.seek(0)
+            return buf.getvalue()
 
     except Exception as exc:
-        logger.warning("QR crop auto-detect failed (%s), using hardcoded ratios", exc)
-        # Empirical: Razorpay 674×1644 image — QR at ~40–64% H, ~13–87% W
-        crop_box = (
-            int(w * 0.13),
-            int(h * 0.40),
-            int(w * 0.87),
-            int(h * 0.64),
-        )
+        logger.warning("QR crop auto-detect failed: %s", exc)
 
-    cropped = img.crop(crop_box)
+    # Fallback only if all detection fails
+    fallback_box = (
+        int(w * 0.15),
+        int(h * 0.35),
+        int(w * 0.85),
+        int(h * 0.65),
+    )
+    cropped = img.crop(fallback_box)
     buf = io.BytesIO()
     cropped.save(buf, format="PNG")
     buf.seek(0)
@@ -190,7 +188,7 @@ def generate_clean_qr_image(upi_str: str) -> bytes:
         version=None,
         error_correction=qrcode.constants.ERROR_CORRECT_M,
         box_size=10,
-        border=3,
+        border=2,
     )
     qr.add_data(upi_str)
     qr.make(fit=True)

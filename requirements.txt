@@ -7,3 +7,4 @@ pillow
 qrcode
 numpy
 httpx
+opencv-python
