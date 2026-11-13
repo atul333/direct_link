@@ -1897,14 +1897,7 @@ async def handle_start_buy_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
     cross_price = row_get(post, "cross_price_inr")
 
     if already:
-        await reply_or_send_text(
-            update, ctx,
-            f"<blockquote><b>✅ You already have active access to {channel['name']}!</b></blockquote>\n\n"
-            "👇 <b>Tap below to receive your protected access link:</b>",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔗 Get Protected Access Link", callback_data=f"getlink:{channel_id}")
-            ]]),
-        )
+        await send_protected_channel_link(ctx.bot, user.id, channel)
         return
 
     # Check for free channel access — zero payment, direct link
@@ -1951,14 +1944,7 @@ async def handle_start_buy_channel(update: Update, ctx: ContextTypes.DEFAULT_TYP
     price = channel["price_inr"]
 
     if already:
-        await reply_or_send_text(
-            update, ctx,
-            f"<blockquote><b>✅ You already have active access to {channel['name']}!</b></blockquote>\n\n"
-            "👇 <b>Tap below to receive your protected access link:</b>",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔗 Get Protected Access Link", callback_data=f"getlink:{channel_id}")
-            ]]),
-        )
+        await send_protected_channel_link(ctx.bot, user.id, channel)
         return
 
     # Check for free channel access — zero payment, direct link
@@ -2187,12 +2173,12 @@ async def cb_view_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     already = await db_has_access(user_id, channel_id)
+    if already:
+        await send_protected_channel_link(ctx.bot, user_id, channel)
+        return
 
     desc = channel["description"] or "🌟 Exclusive VIP Access • Daily Premium Content, Media & Updates 🚀"
-    if already:
-        status_line = "✅ <b>You already have active access to this channel!</b>"
-        action_btn = InlineKeyboardButton("🔗 Retrieve Access Link 🔓", callback_data=f"getlink:{channel_id}")
-    elif channel["price_inr"] <= 0:
+    if channel["price_inr"] <= 0:
         status_line = "🎁 <b>Access Fee:</b> <b>100% Free Channel (₹0)</b>"
         action_btn = InlineKeyboardButton("🎁 Claim Free Instant Access 🚀", callback_data=f"buy:{channel_id}")
     else:
@@ -2232,7 +2218,7 @@ async def cb_get_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await query.answer("❌ You don't have access. Please purchase first.", show_alert=True)
         return
 
-    channel = db.get_channel(DB_PATH, channel_id)
+    channel = await db_get_channel(channel_id)
     await send_protected_channel_link(ctx.bot, user_id, channel)
 
 
@@ -2255,7 +2241,7 @@ async def cb_buy_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     if already:
-        await query.answer("✅ You already have access!", show_alert=True)
+        await send_protected_channel_link(ctx.bot, user_id, channel)
         return
 
     price = channel["price_inr"]
