@@ -3546,35 +3546,16 @@ async def cmd_posts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_clearposts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin command to purge all promotional posts from channels and database."""
+    """Safeguard: inform admin that bulk post deletion has been permanently disabled."""
     if not is_admin(update.effective_user.id):
         return
 
-    conn = db.get_connection(DB_PATH)
-    posts = conn.execute("SELECT id, target_channel, channel_msg_id, title FROM posts").fetchall()
-    deleted_msgs = 0
-    for p in posts:
-        target = p["target_channel"]
-        msg_id = p["channel_msg_id"]
-        if target and msg_id:
-            try:
-                try:
-                    cid = int(target)
-                except ValueError:
-                    cid = target
-                await ctx.bot.delete_message(chat_id=cid, message_id=msg_id)
-                deleted_msgs += 1
-            except Exception:
-                pass
-    conn.execute("DELETE FROM posts")
-    conn.commit()
-    conn.close()
-
     await update.message.reply_text(
-        f"🧹 <b>All Posts Purged!</b>\n\n"
-        f"• Deleted <b>{deleted_msgs}</b> message(s) from main channel\n"
-        f"• Cleared <b>{len(posts)}</b> post records from database\n\n"
-        f"You can now create brand-new posts using /post or /postfree!",
+        "🛡️ <b>Bulk Deletion Permanently Disabled</b>\n\n"
+        "The <code>/clearposts</code> command has been removed to protect against accidental mass deletion of channel posts.\n\n"
+        "<b>To delete a specific post safely:</b>\n"
+        "• Use <code>/delpost &lt;message_id_or_link&gt;</code>\n"
+        "• Or forward the channel post to this chat to delete it with one tap.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -3720,7 +3701,7 @@ async def post_init(app: Application) -> None:
         BotCommand("post", "Create & broadcast paid post to Main Channel"),
         BotCommand("postfree", "Create & broadcast FREE channel post (no payment)"),
         BotCommand("posts", "List broadcast posts"),
-        BotCommand("clearposts", "Delete all posts from channel & DB"),
+        BotCommand("delpost", "Delete a specific post from channel"),
         BotCommand("setmainchannel", "Set default main channel"),
         BotCommand("addchannel", "Add a new channel product"),
         BotCommand("editchannel", "Edit a channel"),
