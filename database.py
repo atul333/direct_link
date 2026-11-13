@@ -612,12 +612,21 @@ def get_recent_posts(db_path: str, limit: int = 10) -> list:
     return rows
 
 
-def get_posts_for_channel(db_path: str, channel_id: int) -> list:
-    """Return all promotional posts created for a specific channel."""
+def get_posts_for_channel(db_path: str, channel_id: int, channel_link: str = "", channel_name: str = "") -> list:
+    """Return all promotional posts created for a specific channel, matching by ID, link hash, or title."""
     conn = get_connection(db_path)
-    rows = conn.execute("""
-        SELECT * FROM posts WHERE channel_id = ?
-    """, (channel_id,)).fetchall()
+    query = "SELECT * FROM posts WHERE channel_id = ?"
+    params = [channel_id]
+    if channel_link:
+        clean = channel_link.strip().rstrip("/")
+        link_hash = clean.split("+")[-1].split("/")[-1].strip()
+        if link_hash and len(link_hash) >= 5:
+            query += " OR caption LIKE ? OR title LIKE ?"
+            params.extend([f"%{link_hash}%", f"%{link_hash}%"])
+    if channel_name:
+        query += " OR title = ?"
+        params.append(channel_name)
+    rows = conn.execute(query, tuple(params)).fetchall()
     conn.close()
     return rows
 
@@ -628,6 +637,34 @@ def delete_post(db_path: str, post_id: int) -> None:
     conn.execute("DELETE FROM posts WHERE id = ?", (post_id,))
     conn.commit()
     conn.close()
+
+
+def delete_posts_for_channel(db_path: str, channel_id: int) -> int:
+    """Delete promotional posts for a specific channel from the DB without touching channel or purchases."""
+    conn = get_connection(db_path)
+    cur = conn.execute("DELETE FROM posts WHERE channel_id = ?", (channel_id,))
+    count = cur.rowcount
+    conn.commit()
+    conn.close()
+    return count
+
+
+def deactivate_channel(db_path: str, channel_id: int) -> None:
+    """Soft-deactivate a channel (sets is_active = 0) without purging records or user access."""
+    conn = get_connection(db_path)
+    conn.execute("UPDATE channels SET is_active = 0 WHERE id = ?", (channel_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_post_by_msg_or_id(db_path: str, id_val: int) -> list:
+    """Find posts matching id_val as either post.id or channel_msg_id."""
+    conn = get_connection(db_path)
+    rows = conn.execute("""
+        SELECT * FROM posts WHERE id = ? OR channel_msg_id = ?
+    """, (id_val, id_val)).fetchall()
+    conn.close()
+    return rows
 
 
 def purge_channel_and_posts(db_path: str, channel_id: int) -> None:
