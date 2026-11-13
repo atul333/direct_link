@@ -41,8 +41,9 @@ from aiohttp import web
 from dotenv import load_dotenv
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    BotCommand, ChatJoinRequest, Bot,
+    BotCommand, ChatJoinRequest, Bot, CallbackQuery, Message,
 )
+from telegram.error import BadRequest, Forbidden
 from telegram.constants import ParseMode, ChatMemberStatus
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -91,19 +92,59 @@ _CHANNEL_CACHE_TTL: float = 60.0
 def get_active_channels_cached() -> list:
     """Return active channels from memory; refresh every 60 s."""
     global _active_channels_cache, _active_channels_cache_time
-    if time.time() - _active_channels_cache_time > _CHANNEL_CACHE_TTL:
-        _active_channels_cache = get_active_channels_cached()
+    if not _active_channels_cache or (time.time() - _active_channels_cache_time > _CHANNEL_CACHE_TTL):
+        _active_channels_cache = db.get_active_channels(DB_PATH)
         _active_channels_cache_time = time.time()
     return _active_channels_cache
 
 def invalidate_channel_cache() -> None:
     """Force cache refresh on next access (call after add/edit/delete channel)."""
-    global _active_channels_cache_time
+    global _active_channels_cache_time, _active_channels_cache
     _active_channels_cache_time = 0.0
+    _active_channels_cache = []
 
 # --- Mandatory-channel membership TTL cache (per user, 5 min) ----------------
 _mandatory_cache: dict[int, tuple] = {}  # {user_id: (timestamp, [unjoined_list])}
 _MANDATORY_CACHE_TTL: float = 300.0  # 5 minutes
+
+# ── Resilient Telegram API wrappers (suppress expired queries & unmodified edits) ──
+_orig_callback_query_answer = CallbackQuery.answer
+_orig_callback_query_edit = CallbackQuery.edit_message_text
+_orig_message_edit_text = Message.edit_text
+
+async def _resilient_callback_query_answer(self, *args, **kwargs):
+    try:
+        return await _orig_callback_query_answer(self, *args, **kwargs)
+    except BadRequest as exc:
+        msg = str(exc).lower()
+        if "query is too old" in msg or "query id is invalid" in msg:
+            logger.debug("Silently ignored expired/invalid callback query: %s", exc)
+            return None
+        raise
+
+async def _resilient_callback_query_edit(self, *args, **kwargs):
+    try:
+        return await _orig_callback_query_edit(self, *args, **kwargs)
+    except BadRequest as exc:
+        msg = str(exc).lower()
+        if "message is not modified" in msg:
+            logger.debug("Silently ignored message not modified in query edit: %s", exc)
+            return None
+        raise
+
+async def _resilient_message_edit_text(self, *args, **kwargs):
+    try:
+        return await _orig_message_edit_text(self, *args, **kwargs)
+    except BadRequest as exc:
+        msg = str(exc).lower()
+        if "message is not modified" in msg:
+            logger.debug("Silently ignored message not modified in msg edit: %s", exc)
+            return self
+        raise
+
+CallbackQuery.answer = _resilient_callback_query_answer
+CallbackQuery.edit_message_text = _resilient_callback_query_edit
+Message.edit_text = _resilient_message_edit_text
 
 
 async def track_user_action_fast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -254,17 +295,18 @@ async def is_user_in_channel(bot: Bot, user_id: int, chat_id: int) -> bool:
         return False
 
 
-async def get_unjoined_mandatory_channels(bot: Bot, user_id: int) -> list[dict]:
+async def get_unjoined_mandatory_channels(bot: Bot, user_id: int, bypass_cache: bool = False) -> list[dict]:
     """Return list of mandatory channels the user has NOT joined yet. Admins bypass.
-    Result is cached per user for 5 minutes to avoid repeated get_chat_member API calls.
+    Result for verified users (all joined) is cached for 5 minutes to avoid repeated get_chat_member API calls.
     """
     if is_admin(user_id):
         return []
 
     now = time.time()
-    cached = _mandatory_cache.get(user_id)
-    if cached and (now - cached[0]) < _MANDATORY_CACHE_TTL:
-        return cached[1]
+    if not bypass_cache:
+        cached = _mandatory_cache.get(user_id)
+        if cached and (now - cached[0]) < _MANDATORY_CACHE_TTL:
+            return cached[1]
 
     unjoined = []
     for cid in MANDATORY_CHANNELS:
@@ -273,7 +315,11 @@ async def get_unjoined_mandatory_channels(bot: Bot, user_id: int) -> list[dict]:
             info = await get_channel_info(bot, cid)
             unjoined.append(info)
 
-    _mandatory_cache[user_id] = (now, unjoined)
+    if not unjoined:
+        _mandatory_cache[user_id] = (now, [])
+    else:
+        _mandatory_cache.pop(user_id, None)
+
     return unjoined
 
 
@@ -444,7 +490,7 @@ async def cb_check_subscription(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
     data = query.data
     resume_action = data.split(":", 1)[1] if ":" in data else "menu"
 
-    unjoined = await get_unjoined_mandatory_channels(ctx.bot, user_id)
+    unjoined = await get_unjoined_mandatory_channels(ctx.bot, user_id, bypass_cache=True)
     if unjoined:
         await query.answer("❌ You haven't joined all mandatory channels yet! Please join all of them first.", show_alert=True)
         await send_mandatory_channels_prompt(query, ctx, unjoined, resume_action)
@@ -2377,6 +2423,7 @@ async def ac_get_chat_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         admin_id,
         chat_id=chat_id,
     )
+    invalidate_channel_cache()
     ctx.user_data.clear()
 
     protection_status = "<b>Enabled ✅ (Join-Request Firewall Active)</b>" if chat_id else "<i>Disabled (Standard link)</i>"
@@ -3122,6 +3169,7 @@ async def post_get_channel_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
         description="🌟 Exclusive VIP Access • Daily Premium Content & Updates 🚀",
         admin_id=admin_id,
     )
+    invalidate_channel_cache()
 
     ctx.user_data["post_channel_id"] = channel_id
     ctx.user_data["channel_default_price"] = 0.0
@@ -3780,7 +3828,25 @@ async def post_shutdown(app: Application) -> None:
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log error and notify user/admin if possible."""
-    logger.error("Exception while handling an update: %s", context.error, exc_info=context.error)
+    err = context.error
+    if isinstance(err, (BadRequest, Forbidden)):
+        err_str = str(err).lower()
+        if any(ign in err_str for ign in [
+            "query is too old",
+            "query id is invalid",
+            "message is not modified",
+            "message to delete not found",
+            "message can't be deleted",
+            "message to edit not found",
+            "message can't be edited",
+            "bot was blocked by the user",
+            "user is deactivated",
+            "chat not found",
+        ]):
+            logger.debug("Harmless Telegram API condition ignored: %s", err)
+            return
+
+    logger.error("Exception while handling an update: %s", err, exc_info=err)
     if isinstance(update, Update) and update.effective_message:
         try:
             await update.effective_message.reply_text(
