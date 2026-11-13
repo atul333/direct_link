@@ -1770,52 +1770,25 @@ async def get_or_create_qr_code(
         )
 
 
-def build_instant_payment_info(
+def build_qr_payment_caption(
     channel_name: str,
     price: float,
+    qr_id: str,
     cross_price: float | None = None,
-    description: str | None = None,
 ) -> str:
-    """Instant first message showing channel details, price, and payment instructions before QR generation."""
+    """Short, clear QR payment caption so the user understands at a glance."""
     if cross_price and cross_price > price:
-        price_line = f"<b>💰 Offer Price:</b> <s>₹{cross_price:.0f}</s>  <b>₹{price:.0f}</b> <i>(Special Offer 🔥)</i>"
+        price_str = f"<s>₹{cross_price:.0f}</s> <b>₹{price:.0f}</b>"
     else:
-        price_line = f"<b>💰 Access Price:</b> <b>₹{price:.0f}</b> <i>(One-Time Fee)</i>"
-
-    desc_block = ""
-    if description:
-        desc_block = f"<b>📖 Details:</b> <i>{description}</i>\n"
+        price_str = f"<b>₹{price:.0f}</b>"
 
     return (
-        f"<blockquote><b>👑 {channel_name} — VIP ACCESS 👑</b></blockquote>\n"
-        f"<blockquote><b>🏷️ Channel:</b> <b>{channel_name}</b>\n"
-        f"{price_line}\n"
-        f"{desc_block}"
-        f"<b>⚡ Validity:</b> Lifetime Access • Instant Auto-Delivery\n"
-        f"<b>💳 Payment Mode:</b> All UPI Apps (GPay • PhonePe • Paytm • BHIM)</blockquote>\n"
-        f"<blockquote><b>📲 NEXT STEP:</b>\n"
-        f"⏳ <b>Generating your unique ₹{price:.0f} UPI QR Code below...</b>\n"
-        f"<i>Simply scan the QR code that appears next and your private invite link will be sent here automatically within 3–5 seconds! 🚀</i></blockquote>"
-    )
-
-
-def build_qr_payment_caption(channel_name: str, price: float, qr_id: str) -> str:
-    """Rich, engaging payment QR caption with clear instructions and advanced emojis."""
-    return (
-        f"<blockquote><b>👑 SCAN & PAY FOR VIP ACCESS 👑</b></blockquote>\n"
-        f"<blockquote><b>🏷️ Channel:</b> <b>{channel_name}</b>\n"
-        f"<b>💵 Pay Amount:</b> <b>₹{price:.0f}</b> <i>(One-Time Fee)</i>\n"
-        f"<b>🧾 Payment Ref ID:</b> <code>{qr_id}</code></blockquote>\n"
-        f"<blockquote><b>📲 HOW TO PAY (FAST & EASY):</b>\n"
-        f"1️⃣ <b>Scan the QR Code</b> above with any UPI app\n"
-        f"   └ <i>GPay • PhonePe • Paytm • BHIM • CRED</i>\n"
-        f"2️⃣ Complete the payment of <b>₹{price:.0f}</b>\n"
-        f"3️⃣ <b>Wait 3–5 seconds</b> — payment is auto-detected!\n"
-        f"   └ <i>Your VIP link will be delivered right here instantly! 🚀</i></blockquote>\n"
-        f"<blockquote>⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b>\n"
-        f"──────────────────────────\n"
-        f"🏆 Admin - {ADMIN_CONTACT}\n"
-        f"💬 <b>Need help?</b> Share your Ref ID (<code>{qr_id}</code>) with Admin.</blockquote>"
+        f"<blockquote><b>👑 {channel_name}</b>\n"
+        f"💵 <b>Pay Amount:</b> {price_str}\n"
+        f"🧾 <b>Ref ID:</b> <code>{qr_id}</code></blockquote>\n"
+        f"<blockquote>📲 <b>Scan QR with any UPI App</b> <i>(GPay / PhonePe / Paytm)</i>\n"
+        f"⚡ <b>Channel link is sent here automatically in 3–5 sec after payment!</b>\n"
+        f"⚠️ <i>One-time link • Admin: {ADMIN_CONTACT}</i></blockquote>"
     )
 
 
@@ -1827,8 +1800,10 @@ async def _background_send_qr(
     channel_name: str,
     price: float,
     post_id: int | None = None,
+    cross_price: float | None = None,
+    delete_msg_id: int | None = None,
 ) -> None:
-    """Background task: generates QR code off the hot path and sends the QR photo immediately after the price message."""
+    """Background task: generates QR code off the hot path and sends ONLY the QR photo with a short message."""
     try:
         qr_id, qr_img_bytes, _ = await get_or_create_qr_code(
             user_id, channel_id, price, channel_name, post_id=post_id
@@ -1845,7 +1820,7 @@ async def _background_send_qr(
             pass
         return
 
-    caption_text = build_qr_payment_caption(channel_name, price, qr_id)
+    caption_text = build_qr_payment_caption(channel_name, price, qr_id, cross_price=cross_price)
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("« Browse All Channels", callback_data="back_menu")],
     ])
@@ -1872,6 +1847,11 @@ async def _background_send_qr(
             await asyncio.to_thread(
                 db.store_qr_message_id, DB_PATH, qr_id, qr_msg.chat_id, qr_msg.message_id
             )
+        if delete_msg_id:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=delete_msg_id)
+            except Exception:
+                pass
     except Exception as exc:
         logger.error("Failed to send QR photo to user %d: %s", user_id, exc)
 
@@ -1906,16 +1886,7 @@ async def handle_start_buy_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
         await send_protected_channel_link(ctx.bot, user.id, channel)
         return
 
-    # STEP 1: Immediately send the price & channel details message first (< 0.1s response)
-    info_text = build_instant_payment_info(
-        channel_name=channel["name"],
-        price=price,
-        cross_price=cross_price,
-        description=row_get(channel, "description"),
-    )
-    await reply_or_send_text(update, ctx, info_text)
-
-    # STEP 2: Generate and send the QR code right after in a background task
+    # Send ONLY the QR code with short message (no extra message before it)
     chat_id = update.effective_chat.id if update.effective_chat else user.id
     asyncio.create_task(
         _background_send_qr(
@@ -1926,6 +1897,7 @@ async def handle_start_buy_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
             channel_name=channel["name"],
             price=price,
             post_id=post_id,
+            cross_price=cross_price,
         )
     )
 
@@ -1953,15 +1925,7 @@ async def handle_start_buy_channel(update: Update, ctx: ContextTypes.DEFAULT_TYP
         await send_protected_channel_link(ctx.bot, user.id, channel)
         return
 
-    # STEP 1: Immediately send the price & channel details message first (< 0.1s response)
-    info_text = build_instant_payment_info(
-        channel_name=channel["name"],
-        price=price,
-        description=row_get(channel, "description"),
-    )
-    await reply_or_send_text(update, ctx, info_text)
-
-    # STEP 2: Generate and send the QR code right after in a background task
+    # Send ONLY the QR code with short message (no extra message before it)
     chat_id = update.effective_chat.id if update.effective_chat else user.id
     asyncio.create_task(
         _background_send_qr(
@@ -2259,22 +2223,9 @@ async def cb_buy_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await send_protected_channel_link(ctx.bot, user_id, channel)
         return
 
-    # STEP 1: Immediately show price & channel payment details first
-    info_text = build_instant_payment_info(
-        channel_name=channel["name"],
-        price=price,
-        description=row_get(channel, "description"),
-    )
-    try:
-        await query.edit_message_text(
-            info_text,
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception:
-        pass
-
-    # STEP 2: Generate and send QR code right after in a background task
+    # Send ONLY the QR code with short message and delete the menu message once QR arrives
     chat_id = query.message.chat_id if query.message else user_id
+    delete_msg_id = query.message.message_id if query.message else None
     asyncio.create_task(
         _background_send_qr(
             bot=ctx.bot,
@@ -2283,6 +2234,7 @@ async def cb_buy_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             channel_id=channel_id,
             channel_name=channel["name"],
             price=price,
+            delete_msg_id=delete_msg_id,
         )
     )
 
