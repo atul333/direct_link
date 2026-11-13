@@ -699,70 +699,34 @@ async def send_protected_channel_link(bot, user_id: int, channel: db.sqlite3.Row
     )
 
 
-async def process_successful_payment(
+_PAYMENT_LOCKS: dict[str, asyncio.Lock] = {}
+_PAID_ORDER_CACHE: set[str] = set()
+_ACTIVE_QR_WATCHERS: dict[str, float] = {}
+
+
+async def _delete_qr_message_safe(bot, chat_id: int, message_id: int, user_id: int) -> None:
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        logger.info("Deleted QR payment message for user %d (msg_id=%s)", user_id, message_id)
+    except Exception as exc:
+        logger.debug("Could not delete QR message for user %d: %s", user_id, exc)
+
+
+async def _notify_admins_of_sale(
     bot,
+    user_id: int,
+    channel_id: int,
+    channel_name: str,
+    amount: float,
     order_id: str,
     payment_id: str,
-    amount_inr: float | None = None,
-    method: str | None = None,
-) -> bool:
-    """
-    Auto-approve payment:
-    1. Update database (mark paid, grant access)
-    2. Delete the pending QR payment message from user's chat
-    3. Deliver protected channel link to buyer (Access Granted message only)
-    4. Notify all admins with full details
-    """
-    payment = db.get_payment_by_order(DB_PATH, order_id)
-    if not payment:
-        logger.warning("No payment record found for order %s", order_id)
-        return False
-
-    already_paid = (payment["status"] == "paid")
-    user_id = payment["user_id"]
-    channel_id = payment["channel_id"]
-    channel = db.get_channel(DB_PATH, channel_id)
-    amount = amount_inr if amount_inr is not None else payment["amount_inr"]
-
-    if not already_paid:
-        db.confirm_payment(DB_PATH, order_id, payment_id)
-        QR_CACHE.pop((user_id, channel_id), None)
-        logger.info("Payment confirmed in DB: order=%s, payment=%s, user=%d, channel=%d",
-                    order_id, payment_id, user_id, channel_id)
-    else:
-        logger.info("Payment %s already marked as paid. Ensuring delivery...", order_id)
-
-    # ── Delete the QR payment message from user's chat ────────────────────────
-    # 1. Try in-memory cache first (check by order_id, then user_id)
-    qr_msg_info = QR_MESSAGE_CACHE.pop(order_id, None) or QR_MESSAGE_CACHE.pop(user_id, None)
-    # 2. Fallback: look up from database (survives bot restarts)
-    if not qr_msg_info:
-        qr_msg_info = db.get_qr_message_info(DB_PATH, order_id)
-    if not qr_msg_info:
-        qr_msg_info = db.get_latest_qr_message_for_user(DB_PATH, user_id)
-    if qr_msg_info:
-        try:
-            await bot.delete_message(
-                chat_id=qr_msg_info["chat_id"],
-                message_id=qr_msg_info["message_id"],
-            )
-            logger.info("Deleted QR payment message for user %d (msg_id=%s)", user_id, qr_msg_info["message_id"])
-        except Exception as exc:
-            logger.debug("Could not delete QR message for user %d: %s", user_id, exc)
-
-    user = db.get_user(DB_PATH, user_id)
-    uname = format_user_display(user['username'], fallback="None") if user else "None"
-    full_name = f"{user['first_name']} {user['last_name']}".strip() if user else "Telegram User"
-
-    # ── Deliver Access Granted message + channel link to buyer ────────────────
+    method: str | None,
+) -> None:
+    """Background task to notify admins after the buyer has already received their channel link."""
     try:
-        if channel:
-            await send_protected_channel_link(bot, user_id, channel)
-    except Exception as exc:
-        logger.error("Failed to send channel link to user %d: %s", user_id, exc)
-
-    # ── Notify admins (only on first approval) ────────────────────────────────
-    if not already_paid:
+        user = await asyncio.to_thread(db.get_user, DB_PATH, user_id)
+        uname = format_user_display(user["username"], fallback="None") if user else "None"
+        full_name = f"{user['first_name']} {user['last_name']}".strip() if user else "Telegram User"
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         isolated_tx_id = f"CLP5000-{payment_id}" if payment_id and not payment_id.startswith("CLP") else (payment_id or "N/A")
         isolated_ref_id = f"CLP5000-{order_id}" if order_id and not order_id.startswith("CLP") else order_id
@@ -773,7 +737,7 @@ async def process_successful_payment(
             f"👤 <b>User ID:</b> <code>{user_id}</code>\n"
             f"👤 <b>Username:</b> {uname}\n"
             f"👤 <b>Name:</b> {full_name}\n"
-            f"🏷️ <b>Channel:</b> <b>{channel['name'] if channel else f'Channel #{channel_id}'}</b>\n"
+            f"🏷️ <b>Channel:</b> <b>{channel_name}</b>\n"
             f"💰 <b>Amount Paid:</b> <b>₹{amount:.0f}</b>\n"
             f"🔒 <b>Isolated Port:</b> <code>{WEBHOOK_PORT}</code>\n"
             f"🧾 <b>Payment Ref:</b> <code>{isolated_ref_id}</code>\n"
@@ -788,8 +752,86 @@ async def process_successful_payment(
                 logger.info("Admin %d notified of payment %s", aid, payment_id)
             except Exception as exc:
                 logger.error("Failed to notify admin %d: %s", aid, exc)
+    except Exception as exc:
+        logger.error("Error in _notify_admins_of_sale: %s", exc)
 
-    return True
+
+async def process_successful_payment(
+    bot,
+    order_id: str,
+    payment_id: str,
+    amount_inr: float | None = None,
+    method: str | None = None,
+) -> bool:
+    """
+    Auto-approve payment with zero-latency link delivery:
+    1. Per-order lock prevents duplicate delivery if webhook + fast-watcher fire simultaneously
+    2. Mark paid & grant access in DB
+    3. Deliver protected channel link AND delete QR message concurrently
+    4. Notify all admins in a background task so buyer never waits
+    """
+    lock = _PAYMENT_LOCKS.get(order_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PAYMENT_LOCKS[order_id] = lock
+
+    async with lock:
+        _ACTIVE_QR_WATCHERS.pop(order_id, None)
+        if order_id in _PAID_ORDER_CACHE:
+            return True
+
+        payment = await asyncio.to_thread(db.get_payment_by_order, DB_PATH, order_id)
+        if not payment:
+            logger.warning("No payment record found for order %s", order_id)
+            return False
+
+        already_paid = (payment["status"] == "paid")
+        user_id = payment["user_id"]
+        channel_id = payment["channel_id"]
+        amount = amount_inr if amount_inr is not None else payment["amount_inr"]
+
+        if not already_paid:
+            await asyncio.to_thread(db.confirm_payment, DB_PATH, order_id, payment_id)
+            QR_CACHE.pop((user_id, channel_id), None)
+            logger.info(
+                "Payment confirmed in DB: order=%s, payment=%s, user=%d, channel=%d",
+                order_id, payment_id, user_id, channel_id,
+            )
+        else:
+            _PAID_ORDER_CACHE.add(order_id)
+            logger.info("Payment %s already marked as paid.", order_id)
+            return True
+
+        _PAID_ORDER_CACHE.add(order_id)
+        channel = await db_get_channel(channel_id)
+
+        # Look up QR message to delete (in-memory cache first, DB fallback)
+        qr_msg_info = QR_MESSAGE_CACHE.pop(order_id, None) or QR_MESSAGE_CACHE.pop(user_id, None)
+        if not qr_msg_info:
+            qr_msg_info = (
+                await asyncio.to_thread(db.get_qr_message_info, DB_PATH, order_id)
+                or await asyncio.to_thread(db.get_latest_qr_message_for_user, DB_PATH, user_id)
+            )
+
+        # Deliver channel link to buyer AND delete QR message concurrently for instant delivery!
+        tasks = []
+        if channel:
+            tasks.append(send_protected_channel_link(bot, user_id, channel))
+        if qr_msg_info:
+            tasks.append(
+                _delete_qr_message_safe(bot, qr_msg_info["chat_id"], qr_msg_info["message_id"], user_id)
+            )
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Notify admins asynchronously in background so buyer link delivery is never delayed
+        ch_name = channel["name"] if channel else f"Channel #{channel_id}"
+        asyncio.create_task(
+            _notify_admins_of_sale(
+                bot, user_id, channel_id, ch_name, amount, order_id, payment_id, method
+            )
+        )
+        return True
 
 
 
@@ -875,7 +917,7 @@ async def handle_razorpay_webhook(request: web.Request) -> web.Response:
                 return web.json_response({"status": "ignored", "reason": "no_ref_id"})
 
             # 5. Database record verification — ensures QR was generated in THIS bot's database
-            payment = db.find_payment(DB_PATH, ref_id)
+            payment = await asyncio.to_thread(db.find_payment, DB_PATH, ref_id)
             if not payment:
                 logger.info(
                     "Webhook ref %s does not exist in this bot's database (%s). Ignored.",
@@ -894,7 +936,9 @@ async def handle_razorpay_webhook(request: web.Request) -> web.Response:
 
             logger.info("Processing verified payment for this bot: ref_id=%s, payment_id=%s, amount=₹%s", ref_id, payment_id, amount_inr)
             bot = request.app["bot"]
-            await process_successful_payment(bot, ref_id, payment_id, amount_inr, method)
+            asyncio.create_task(
+                process_successful_payment(bot, payment["razorpay_order_id"], payment_id, amount_inr, method)
+            )
 
         return web.json_response({"status": "ok", "bot_id": str(BOT_ID), "port": WEBHOOK_PORT})
     except Exception as exc:
@@ -934,9 +978,57 @@ async def start_webhook_server(bot) -> web.AppRunner:
     return runner
 
 
+async def _watch_single_qr_fast(bot, qr_id: str, amount_inr: float) -> None:
+    """
+    Dedicated per-QR fast watcher: polls Razorpay every 1.5s for the first 3 minutes
+    after a QR code is sent to a user so link delivery happens within ~1 second of payment.
+    """
+    client = rzp_client()
+    try:
+        while qr_id in _ACTIVE_QR_WATCHERS and qr_id not in _PAID_ORDER_CACHE:
+            refreshed_at = _ACTIVE_QR_WATCHERS.get(qr_id, 0.0)
+            age = time.time() - refreshed_at
+            if age > 600:
+                break
+            interval = 1.5 if age < 180 else 3.0
+            await asyncio.sleep(interval)
+
+            if qr_id in _PAID_ORDER_CACHE or qr_id not in _ACTIVE_QR_WATCHERS:
+                break
+
+            try:
+                payments_list = await asyncio.to_thread(pay.fetch_qr_payments, client, qr_id)
+                if payments_list:
+                    for item in payments_list:
+                        if item.get("status") in ("captured", "authorized"):
+                            payment_id = item.get("id")
+                            method = item.get("method", "UPI QR")
+                            logger.info("Fast QR watcher detected paid QR code in %.1fs: %s", age, qr_id)
+                            await process_successful_payment(
+                                bot, qr_id, payment_id, amount_inr, method
+                            )
+                            return
+            except Exception as exc:
+                logger.debug("Fast watcher error for %s: %s", qr_id, exc)
+    finally:
+        _ACTIVE_QR_WATCHERS.pop(qr_id, None)
+
+
+def start_qr_fast_watcher(bot, qr_id: str, amount_inr: float) -> None:
+    """Start or refresh the 1.5s high-speed watcher for an active QR code."""
+    if qr_id in _PAID_ORDER_CACHE:
+        return
+    already_watching = qr_id in _ACTIVE_QR_WATCHERS
+    _ACTIVE_QR_WATCHERS[qr_id] = time.time()
+    if not already_watching:
+        asyncio.create_task(_watch_single_qr_fast(bot, qr_id, amount_inr))
+
+
 async def _check_single_pending_payment(bot, client, p, sem: asyncio.Semaphore) -> None:
     """Non-blocking worker for checking a single pending payment off the event loop."""
     ref_id = p["razorpay_order_id"]
+    if ref_id in _PAID_ORDER_CACHE or ref_id in _ACTIVE_QR_WATCHERS:
+        return
     async with sem:
         try:
             if ref_id.startswith("qr_"):
@@ -985,22 +1077,22 @@ async def _check_single_pending_payment(bot, client, p, sem: asyncio.Semaphore) 
 async def poll_pending_payments(bot) -> None:
     """Non-blocking tiered background task checking pending Razorpay QR codes & orders."""
     logger.info("Payment auto-poller worker started (non-blocking tiered mode).")
-    sem = asyncio.Semaphore(4)
+    sem = asyncio.Semaphore(10)
     cycle = 0
     while True:
         try:
-            await asyncio.sleep(6)
+            await asyncio.sleep(3)
             cycle += 1
 
-            # Tier 1: Active recent QRs (last 15 minutes) — checked every 6s
+            # Tier 1: Active recent QRs (last 15 minutes) — checked every 3s
             pending_orders = await asyncio.to_thread(
-                db.get_all_pending_payments, DB_PATH, minutes=15, limit=25
+                db.get_all_pending_payments, DB_PATH, minutes=15, limit=50
             )
 
-            # Tier 2: Older QRs (15 to 90 minutes) — checked once every ~60s + expire >2h stale rows
+            # Tier 2: Older QRs (15 to 90 minutes) — checked once every ~30s + expire >2h stale rows
             if cycle % 10 == 0:
                 older_orders = await asyncio.to_thread(
-                    db.get_all_pending_payments, DB_PATH, minutes=90, min_age_minutes=15, limit=25
+                    db.get_all_pending_payments, DB_PATH, minutes=90, min_age_minutes=15, limit=30
                 )
                 if older_orders:
                     pending_orders = list(pending_orders) + list(older_orders)
@@ -1825,6 +1917,9 @@ async def _background_send_qr(
         [InlineKeyboardButton("« Browse All Channels", callback_data="back_menu")],
     ])
 
+    # Start 1.5s high-speed watcher for this QR immediately so payment is detected in ~1 second
+    start_qr_fast_watcher(bot, qr_id, price)
+
     bio = io.BytesIO(qr_img_bytes)
     bio.name = "qr.png"
     try:
@@ -1844,8 +1939,10 @@ async def _background_send_qr(
                 "chat_id": qr_msg.chat_id,
                 "message_id": qr_msg.message_id,
             }
-            await asyncio.to_thread(
-                db.store_qr_message_id, DB_PATH, qr_id, qr_msg.chat_id, qr_msg.message_id
+            asyncio.create_task(
+                asyncio.to_thread(
+                    db.store_qr_message_id, DB_PATH, qr_id, qr_msg.chat_id, qr_msg.message_id
+                )
             )
         if delete_msg_id:
             try:
