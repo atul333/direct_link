@@ -5,6 +5,7 @@ database.py — SQLite database layer for Channel Link Provider Bot
 import sqlite3
 import logging
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -12,43 +13,87 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-# ── Per-thread persistent SQLite connection pool (WAL mode, zero contention) ──
-_THREAD_LOCAL = threading.local()
-_WRITE_LOCK = threading.Lock()
+# ── Persistent Autocommit SQLite Connection Pool (Zero-Lock Contention) ──────
+_WRITE_LOCK = threading.RLock()
+_DB_CONNS: dict[str, "_SafeConnection"] = {}
 _CENTRAL_INITIALISED: set[str] = set()
 
 
-def _configure_conn(conn: sqlite3.Connection) -> sqlite3.Connection:
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA cache_size=-32000")  # 32MB page cache
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA temp_store=MEMORY")
-    return conn
-
-
-def get_connection(db_path: str) -> sqlite3.Connection:
-    """Return a per-thread persistent SQLite connection (creates once per thread, reuses always).
-    Safe against multi-thread cursor collisions and closed-connection errors.
+class _SafeConnection:
     """
-    conns: dict[str, sqlite3.Connection] = getattr(_THREAD_LOCAL, "conns", None)
-    if conns is None:
-        conns = {}
-        _THREAD_LOCAL.conns = conns
+    Thread-safe wrapper around a single autocommit (isolation_level=None) SQLite connection.
+    - Eliminates cross-connection 'database is locked' errors inside the process
+    - Never leaves an uncommitted transaction open
+    - Retries automatically if an external process briefly locks the file
+    - Ignores accidental .close() calls so the shared connection stays alive
+    """
 
-    conn = conns.get(db_path)
-    if conn is not None:
-        try:
-            conn.execute("SELECT 1")
-            return conn
-        except Exception:
-            conns.pop(db_path, None)
+    def __init__(self, raw_conn: sqlite3.Connection) -> None:
+        self._conn = raw_conn
 
-    conn = _configure_conn(sqlite3.connect(db_path, timeout=10.0, check_same_thread=False))
-    conns[db_path] = conn
-    return conn
+    def execute(self, sql: str, parameters: tuple | list = ()) -> sqlite3.Cursor:
+        for attempt in range(6):
+            try:
+                with _WRITE_LOCK:
+                    return self._conn.execute(sql, parameters)
+            except sqlite3.OperationalError as exc:
+                if "locked" in str(exc).lower() and attempt < 5:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                raise
+
+    def cursor(self) -> "_SafeConnection":
+        return self
+
+    def commit(self) -> None:
+        with _WRITE_LOCK:
+            if self._conn.in_transaction:
+                self._conn.commit()
+
+    def close(self) -> None:
+        # No-op: keep persistent connection alive
+        pass
+
+    @property
+    def row_factory(self):
+        return self._conn.row_factory
+
+    @row_factory.setter
+    def row_factory(self, val) -> None:
+        self._conn.row_factory = val
+
+
+def _create_safe_conn(db_path: str) -> _SafeConnection:
+    raw = sqlite3.connect(
+        db_path,
+        timeout=30.0,
+        isolation_level=None,  # Autocommit mode: never holds open transactions
+        check_same_thread=False,
+    )
+    raw.row_factory = sqlite3.Row
+    raw.execute("PRAGMA journal_mode=WAL")
+    raw.execute("PRAGMA synchronous=NORMAL")
+    raw.execute("PRAGMA busy_timeout=30000")
+    raw.execute("PRAGMA cache_size=-32000")  # 32MB page cache
+    raw.execute("PRAGMA foreign_keys=ON")
+    raw.execute("PRAGMA temp_store=MEMORY")
+    return _SafeConnection(raw)
+
+
+def get_connection(db_path: str) -> _SafeConnection:
+    """Return a thread-safe persistent autocommit SQLite connection per db_path."""
+    with _WRITE_LOCK:
+        conn = _DB_CONNS.get(db_path)
+        if conn is not None:
+            try:
+                conn.execute("SELECT 1")
+                return conn
+            except Exception:
+                _DB_CONNS.pop(db_path, None)
+
+        conn = _create_safe_conn(db_path)
+        _DB_CONNS[db_path] = conn
+        return conn
 
 
 def init_db(db_path: str) -> None:
