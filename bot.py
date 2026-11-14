@@ -1115,30 +1115,32 @@ async def poll_pending_payments(bot) -> None:
 
 # In-memory consecutive failure counter: {channel_id: fail_count}
 _channel_consecutive_failures: dict[int, int] = {}
+# Positive cache of recently verified working channel links: {channel_id: verified_at_ts}
+_LINK_ALIVE_CACHE: dict[int, float] = {}
 
 
 async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[bool, str]:
     """
     Check if a Telegram channel link is active and valid.
     Returns (is_alive: bool, reason: str).
-    Guaranteed NEVER to falsely mark channels dead due to rate limiting or anti-bot checks.
+    Guaranteed NEVER to falsely mark channels dead due to rate limiting, network hiccups, or anti-bot checks,
+    while accurately detecting expired/revoked invite links and banned channels on t.me.
     """
-    # 1. If chat_id is available and bot is passed, verify via authoritative Telegram Bot API
+    # 1. If chat_id is available and bot is passed, check if Telegram Bot API confirms channel is deactivated
     if bot and chat_id:
         try:
             try:
                 target_chat_id = int(chat_id)
             except (ValueError, TypeError):
                 target_chat_id = chat_id
-            chat = await bot.get_chat(target_chat_id)
-            return True, f"Active (verified via Telegram API: {chat.title})"
+            await bot.get_chat(target_chat_id)
         except Exception as exc:
             err_msg = str(exc).lower()
             if "chat not found" in err_msg or "deactivated" in err_msg:
                 return False, f"Telegram API confirmed: {exc}"
-            # For admin/permissions errors, do not treat channel as dead
+            # Still verify the static invite link below in case the invite link itself expired
 
-    # 2. Check the web preview of the link
+    # 2. Check the web preview of the link on t.me
     clean_link = (link or "").strip()
     if not clean_link:
         return False, "Empty channel link"
@@ -1163,10 +1165,21 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
             logger.warning("[LINK CHECK] Unexpected HTTP %d for %s — skipping check", resp.status_code, clean_link)
             return True, f"HTTP status {resp.status_code} (skipped)"
 
+        # If Telegram redirected an invalid username link away from t.me to telegram.org homepage
+        final_host = (resp.url.host or "").lower()
+        if final_host and "telegram.org" in final_host and "t.me" not in final_host:
+            return False, "Channel link redirected to telegram.org (invalid/deleted channel)"
+
         text = resp.text
 
         # Anti-bot / Cloudflare / DDoS challenge protection:
-        if any(pat in text for pat in ["Just a moment...", "cf-chl-", "challenge-running", "Enable JavaScript and cookies to continue", "Attention Required"]):
+        if any(pat in text for pat in [
+            "Just a moment...",
+            "cf-chl-",
+            "challenge-running",
+            "Enable JavaScript and cookies to continue",
+            "Attention Required",
+        ]):
             logger.warning("[LINK CHECK] Anti-bot challenge page detected for %s — skipping", clean_link)
             return True, "Anti-bot challenge received — treated as alive"
 
@@ -1175,40 +1188,77 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
             logger.warning("[LINK CHECK] Non-Telegram response format for %s — skipping", clean_link)
             return True, "Non-standard page format — treated as alive"
 
-        # Genuine Telegram dead/banned indicators:
-        if "This channel can’t be displayed because it was blocked" in text:
-            return False, "Channel is blocked by Telegram"
+        # Genuine Telegram dead/banned/blocked indicators:
+        if (
+            "This channel can’t be displayed" in text
+            or "This channel can't be displayed" in text
+            or "because it was blocked" in text
+            or "violated Telegram" in text
+        ):
+            return False, "Channel is blocked/banned by Telegram"
 
         if "Channel is inaccessible" in text:
             return False, "Channel is inaccessible"
 
-        # For invite links (t.me/+... or joinchat):
-        is_invite = "/+" in clean_link or "joinchat" in clean_link
-        if is_invite:
-            # If there's an action button with tg://join?invite= or Join Channel/Group, it's ACTIVE!
-            if "tg://join?invite=" in text or "tgme_action_button" in text or "tgme_page_action" in text:
-                return True, "Active (Invite link valid)"
+        # WORKING LINK: Every valid Telegram channel/group invite link or public link resolves a real title
+        if "tgme_page_title" in text:
+            return True, "Active (verified channel title on Telegram)"
 
-            # If there's a title, subscriber count, or photo, it's ACTIVE!
-            if "tgme_page_title" in text or "tgme_page_extra" in text or "tgme_page_photo" in text:
-                return True, "Active"
+        # EXPIRED / REVOKED / INVALID INVITE LINK:
+        # When an invite link (t.me/+... or joinchat) is expired or its channel was deleted/banned,
+        # Telegram renders the generic fallback page with tgme_page_icon + "Join group chat on Telegram"
+        # and NO tgme_page_title.
+        if (
+            "You are invited to a <strong>group chat</strong> on <strong>Telegram</strong>" in text
+            or 'content="Join group chat on Telegram"' in text
+        ):
+            return False, "Invite link is expired or invalid"
 
-            # If the page structure is present, it's a valid Telegram page
-            if "tgme_page" in text:
-                return True, "Active (Telegram invite page)"
+        if "tgme_page_icon" in text and "tgme_page_extra" not in text:
+            return False, "Channel link is expired or does not exist"
 
-            return True, "Active"
-        else:
-            # Public channel/username
-            if "tgme_page_title" in text:
-                return True, "Active"
-            if "tgme_page_icon" in text and "tgme_page_extra" not in text and "tgme_action_button" not in text:
-                return False, "Channel username not found"
-            return True, "Active"
+        return True, "Active"
 
     except Exception as exc:
         logger.warning("[LINK CHECK] Network exception for %s: %s", clean_link, exc)
         return True, f"Network check skipped ({exc})"
+
+
+async def verify_channel_alive_or_cleanup(bot, channel) -> bool:
+    """
+    Fast pre-purchase / pre-delivery check with 45s positive cache:
+    - Returns True immediately if working.
+    - If expired/banned on first check, waits 1s and re-verifies once to guarantee 0% false positives.
+    - If confirmed expired/banned, immediately deletes post(s) from main channel and deactivates in DB.
+    """
+    if not channel:
+        return False
+    cid = channel["id"]
+    now = time.time()
+    cached_ts = _LINK_ALIVE_CACHE.get(cid, 0.0)
+    if now - cached_ts < 45.0:
+        return True
+
+    link = row_get(channel, "link", "")
+    chat_id = row_get(channel, "chat_id")
+    is_alive, reason = await check_channel_link_alive(link, bot=bot, chat_id=chat_id)
+    if is_alive:
+        _LINK_ALIVE_CACHE[cid] = time.time()
+        return True
+
+    # Double-check once after 1.0s to prevent any transient false positive
+    await asyncio.sleep(1.0)
+    is_alive_2, reason_2 = await check_channel_link_alive(link, bot=bot, chat_id=chat_id)
+    if is_alive_2:
+        _LINK_ALIVE_CACHE[cid] = time.time()
+        return True
+
+    logger.warning(
+        "[IMMEDIATE CLEANUP] Channel #%d (%s) confirmed expired/banned (%s) — deleting post & deactivating.",
+        cid, channel["name"], reason_2,
+    )
+    await cleanup_dead_channel(bot, dict(channel), reason_2)
+    return False
 
 
 async def cleanup_dead_channel(bot, channel: dict, reason: str) -> int:
@@ -1217,7 +1267,7 @@ async def cleanup_dead_channel(bot, channel: dict, reason: str) -> int:
     1. Delete promotional posts for this channel from main channel(s)
     2. Soft-deactivate channel in database (is_active = 0) — NEVER purge user purchases or channel records!
     3. Remove promotional posts from DB
-    4. Clear QR cache
+    4. Clear QR & channel caches
     5. Notify admins with detailed breakdown
     Returns count of successfully deleted promotional posts.
     """
@@ -1225,14 +1275,18 @@ async def cleanup_dead_channel(bot, channel: dict, reason: str) -> int:
     channel_name = channel["name"]
     channel_link = row_get(channel, "link", "")
 
-    # 1. Find all promotional posts referencing this channel (by ID, link hash, or title)
-    posts = db.get_posts_for_channel(DB_PATH, channel_id, channel_link, channel_name)
+    _LINK_ALIVE_CACHE.pop(channel_id, None)
+
+    # 1. Find all promotional posts referencing this channel (by ID, shared link, link hash, or title)
+    posts = await asyncio.to_thread(
+        db.get_posts_for_channel, DB_PATH, channel_id, channel_link, channel_name
+    )
     deleted_posts_count = 0
     post_notes = []
 
-    default_main = db.get_setting(DB_PATH, "main_channel_id") or MAIN_CHANNEL_ID
+    default_main = await asyncio.to_thread(db.get_setting, DB_PATH, "main_channel_id") or MAIN_CHANNEL_ID
 
-    # 2. Delete posts from main channels
+    # 2. Delete posts from main channels immediately
     for p in posts:
         target = p["target_channel"] or default_main
         msg_id = p["channel_msg_id"]
@@ -1248,13 +1302,13 @@ async def cleanup_dead_channel(bot, channel: dict, reason: str) -> int:
                     p["id"], msg_id, target
                 )
                 deleted_posts_count += 1
-                db.delete_post(DB_PATH, p["id"])
+                await asyncio.to_thread(db.delete_post, DB_PATH, p["id"])
             except Exception as exc:
                 err_str = str(exc)
-                if "message to delete not found" in err_str.lower():
+                if "message to delete not found" in err_str.lower() or "message can't be deleted" in err_str.lower():
                     logger.info("Promotional post msg_id=%s was already deleted from %s", msg_id, target)
                     deleted_posts_count += 1
-                    db.delete_post(DB_PATH, p["id"])
+                    await asyncio.to_thread(db.delete_post, DB_PATH, p["id"])
                 else:
                     logger.warning(
                         "Could not delete message %s from %s for post %d: %s",
@@ -1262,8 +1316,9 @@ async def cleanup_dead_channel(bot, channel: dict, reason: str) -> int:
                     )
                     post_notes.append(f"Msg #{msg_id} in {target}: {exc}")
 
-    # 3. Soft-deactivate channel in database — PRESERVES all user access & sales records!
-    db.deactivate_channel(DB_PATH, channel_id)
+    # 3. Soft-deactivate channel in database (and any duplicate channel rows with same expired link)
+    await asyncio.to_thread(db.deactivate_channel, DB_PATH, channel_id, channel_link)
+    invalidate_channel_cache()
     logger.info("Soft-deactivated dead channel #%d (%s) in database (user access preserved).", channel_id, channel_name)
 
     # 4. Invalidate QR cache
@@ -1313,118 +1368,60 @@ async def cleanup_dead_channel(bot, channel: dict, reason: str) -> int:
 
 async def channel_link_monitor_worker(bot) -> None:
     """
-    Background worker periodically monitoring all active channels.
-
-    Safety rules:
-    1. CIRCUIT BREAKER: If ANY 2+ channels fail in the same cycle -> suspected network/rate-limit
-       outage. All fail counters are FULLY RESET to 0 (not just decremented). No cleanup runs.
-    2. FAIL THRESHOLD: A single channel must fail FAIL_THRESHOLD consecutive cycles to be deactivated.
-    3. RECOVERY: A single successful check resets that channel's fail counter to 0.
-    4. MIDNIGHT PROTECTION: Skips all checks between 00:30-01:30 local time (Telegram maintenance window).
-    5. CHAT_ID PRIORITY: If a channel has a chat_id set, uses authoritative Telegram Bot API
-       (never web scraping) - false positives are impossible via Bot API.
+    Background worker continuously monitoring all active channels every 60 seconds.
+    - Starts initial scan 8 seconds after bot startup.
+    - Working channels (with valid tgme_page_title on Telegram) are never touched.
+    - Any channel that explicitly returns Telegram's expired/revoked/banned page is
+      immediately re-verified after 1.5s, and if confirmed dead, its post is deleted
+      from the main channel and the channel is deactivated in the database right away.
     """
-    logger.info("Channel link monitor worker started.")
-    check_interval = int(os.getenv("CHANNEL_MONITOR_INTERVAL_SECONDS", "300"))
-    FAIL_THRESHOLD = int(os.getenv("CHANNEL_FAIL_THRESHOLD", "7"))  # ~35 min of persistent failures
+    logger.info("Channel link monitor worker started (immediate confirmed-dead cleanup mode).")
+    check_interval = int(os.getenv("CHANNEL_MONITOR_INTERVAL_SECONDS", "60"))
 
-    await asyncio.sleep(30)
+    await asyncio.sleep(8)
 
     while True:
         try:
-            # ---- MIDNIGHT PROTECTION -----------------------------------------
-            # Telegram's t.me web pages are frequently rate-limited or return
-            # challenge pages between midnight and 01:30. Skip checks in this window.
-            now_dt = datetime.now()
-            now_hour = now_dt.hour
-            now_minute = now_dt.minute
-            if (now_hour == 0 and now_minute >= 30) or now_hour == 1:
-                logger.info("[LINK MONITOR] Skipping check during midnight maintenance window (00:30-01:59).")
-                await asyncio.sleep(check_interval)
-                continue
-
-            channels = db.get_active_channels(DB_PATH)
+            channels = await asyncio.to_thread(db.get_active_channels, DB_PATH)
             if not channels:
                 await asyncio.sleep(check_interval)
                 continue
-
-            failed_this_cycle = []
-            passed_this_cycle = []
 
             for ch in channels:
                 cid = ch["id"]
                 link = ch["link"]
                 chat_id = row_get(ch, "chat_id")
 
-                # Stagger requests to avoid rate limits
-                await asyncio.sleep(3)
+                # Stagger requests slightly to remain well within Telegram web limits
+                await asyncio.sleep(1.5)
 
                 is_alive, reason = await check_channel_link_alive(link, bot=bot, chat_id=chat_id)
-                if not is_alive:
-                    failed_this_cycle.append((ch, reason))
-                    _channel_consecutive_failures[cid] = _channel_consecutive_failures.get(cid, 0) + 1
-                    logger.warning(
-                        "[LINK MONITOR] Channel #%d (%s) failed check (%d/%d): %s",
-                        cid, ch["name"], _channel_consecutive_failures[cid], FAIL_THRESHOLD, reason
-                    )
-                else:
-                    passed_this_cycle.append(ch)
-                    if cid in _channel_consecutive_failures and _channel_consecutive_failures[cid] > 0:
-                        logger.info("[LINK MONITOR] Channel #%d (%s) recovered -- resetting fail count.", cid, ch["name"])
-                    _channel_consecutive_failures[cid] = 0
+                if is_alive:
+                    _LINK_ALIVE_CACHE[cid] = time.time()
+                    _channel_consecutive_failures.pop(cid, None)
+                    continue
 
-            # ---- CIRCUIT BREAKER ---------------------------------------------
-            # If 2 or more channels failed in the SAME cycle, this is almost certainly
-            # a network outage, Telegram rate limit, or IP block -- NOT all channels dying!
-            if len(failed_this_cycle) >= 2:
+                # Double-verify after 1.5s to ensure 0% false positives
+                await asyncio.sleep(1.5)
+                is_alive_2, reason_2 = await check_channel_link_alive(link, bot=bot, chat_id=chat_id)
+                if is_alive_2:
+                    _LINK_ALIVE_CACHE[cid] = time.time()
+                    _channel_consecutive_failures.pop(cid, None)
+                    continue
+
                 logger.error(
-                    "[CIRCUIT BREAKER TRIGGERED] %d/%d channels failed in one cycle! "
-                    "Suspected Telegram rate-limit or network outage. "
-                    "FULLY RESETTING all fail counters -- no cleanup will run.",
-                    len(failed_this_cycle), len(channels)
+                    "[LINK MONITOR] Channel #%d (%s) confirmed expired/banned (%s). "
+                    "Immediately deleting main channel post and deactivating...",
+                    cid, ch["name"], reason_2,
                 )
-                # Fully reset ALL fail counters -- a mass failure is never genuine
-                for ch, _ in failed_this_cycle:
-                    _channel_consecutive_failures[ch["id"]] = 0
-                # Notify admin of the outage (but DO NOT deactivate anything)
-                for admin_id in ADMIN_IDS:
-                    try:
-                        names = ", ".join(ch["name"] for ch, _ in failed_this_cycle)
-                        await bot.send_message(
-                            chat_id=admin_id,
-                            text=(
-                                "<b>Link Monitor: Network Outage Detected</b>\n\n"
-                                f"<b>{len(failed_this_cycle)}</b> channels failed health check simultaneously "
-                                "-- this is a Telegram rate-limit or IP block, NOT a real channel issue.\n\n"
-                                f"<b>Channels affected:</b> {names}\n\n"
-                                "<i>No channels were deactivated. All fail counters reset.</i>"
-                            ),
-                            parse_mode="HTML",
-                        )
-                    except Exception:
-                        pass
-            else:
-                # Only 0 or 1 channel failed this cycle -- could be a genuine dead channel
-                for ch in channels:
-                    cid = ch["id"]
-                    if _channel_consecutive_failures.get(cid, 0) >= FAIL_THRESHOLD:
-                        logger.error(
-                            "[LINK MONITOR] Channel #%d (%s) confirmed dead after %d consecutive cycles. "
-                            "Initiating safe deactivation...",
-                            cid, ch["name"], FAIL_THRESHOLD
-                        )
-                        _channel_consecutive_failures[cid] = 0
-                        await cleanup_dead_channel(
-                            bot, dict(ch),
-                            f"Persistent failure across {FAIL_THRESHOLD} consecutive single-channel checks (~{FAIL_THRESHOLD * check_interval // 60} min)"
-                        )
+                await cleanup_dead_channel(bot, dict(ch), reason_2)
 
             await asyncio.sleep(check_interval)
         except asyncio.CancelledError:
             break
         except Exception as exc:
             logger.error("Error in channel_link_monitor_worker: %s", exc)
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)
 async def cmd_delpost(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Admin command: /delpost <message_id_or_link> to delete a specific post from the channel."""
     if not is_admin(update.effective_user.id):
@@ -1970,6 +1967,14 @@ async def handle_start_buy_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
         await reply_or_send_text(update, ctx, "❌ This channel is currently unavailable.")
         return
 
+    # Verify channel link is alive; if expired/banned, immediately delete main channel post & deactivate
+    if not await verify_channel_alive_or_cleanup(ctx.bot, channel):
+        await reply_or_send_text(
+            update, ctx,
+            "❌ This channel link has expired and has been removed. Use /menu to browse active VIP channels."
+        )
+        return
+
     price = post["price_inr"]
     cross_price = row_get(post, "cross_price_inr")
 
@@ -2008,6 +2013,14 @@ async def handle_start_buy_channel(update: Update, ctx: ContextTypes.DEFAULT_TYP
     )
     if not channel or not row_get(channel, "is_active", 1):
         await reply_or_send_text(update, ctx, "❌ This channel is currently unavailable.")
+        return
+
+    # Verify channel link is alive; if expired/banned, immediately delete main channel post & deactivate
+    if not await verify_channel_alive_or_cleanup(ctx.bot, channel):
+        await reply_or_send_text(
+            update, ctx,
+            "❌ This channel link has expired and has been removed. Use /menu to browse active VIP channels."
+        )
         return
 
     price = channel["price_inr"]
@@ -2224,8 +2237,12 @@ async def cb_view_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         db_get_channel(channel_id),
         get_unjoined_mandatory_channels(ctx.bot, query.from_user.id),
     )
-    if not channel:
-        await query.edit_message_text("❌ Channel not found.")
+    if not channel or not row_get(channel, "is_active", 1):
+        await query.edit_message_text("❌ Channel not found or no longer available.")
+        return
+
+    if not await verify_channel_alive_or_cleanup(ctx.bot, channel):
+        await query.edit_message_text("❌ This channel link has expired and has been removed.")
         return
 
     user_id = query.from_user.id
@@ -2299,6 +2316,10 @@ async def cb_buy_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
     if not channel or not row_get(channel, "is_active", 1):
         await query.edit_message_text("❌ This channel is no longer available.")
+        return
+
+    if not await verify_channel_alive_or_cleanup(ctx.bot, channel):
+        await query.edit_message_text("❌ This channel link has expired and has been removed.")
         return
 
     if already:

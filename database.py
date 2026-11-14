@@ -720,13 +720,15 @@ def get_recent_posts(db_path: str, limit: int = 10) -> list:
 
 
 def get_posts_for_channel(db_path: str, channel_id: int, channel_link: str = "", channel_name: str = "") -> list:
-    """Return all promotional posts created for a specific channel, matching by ID, link hash, or title."""
+    """Return all promotional posts created for a specific channel, matching by ID, shared link, link hash, or title."""
     conn = get_connection(db_path)
     query = "SELECT * FROM posts WHERE channel_id = ?"
-    params = [channel_id]
+    params: list = [channel_id]
     if channel_link:
-        clean = channel_link.strip().rstrip("/")
-        link_hash = clean.split("+")[-1].split("/")[-1].strip()
+        clean = channel_link.strip()
+        query += " OR channel_id IN (SELECT id FROM channels WHERE link = ?)"
+        params.append(clean)
+        link_hash = clean.rstrip("/").split("+")[-1].split("/")[-1].strip()
         if link_hash and len(link_hash) >= 5:
             query += " OR caption LIKE ? OR title LIKE ?"
             params.extend([f"%{link_hash}%", f"%{link_hash}%"])
@@ -755,11 +757,17 @@ def delete_posts_for_channel(db_path: str, channel_id: int) -> int:
     return count
 
 
-def deactivate_channel(db_path: str, channel_id: int) -> None:
+def deactivate_channel(db_path: str, channel_id: int, channel_link: str = "") -> None:
     """Soft-deactivate a channel (sets is_active = 0) without purging records or user access."""
     conn = get_connection(db_path)
     with _WRITE_LOCK:
-        conn.execute("UPDATE channels SET is_active = 0 WHERE id = ?", (channel_id,))
+        if channel_link and channel_link.strip():
+            conn.execute(
+                "UPDATE channels SET is_active = 0 WHERE id = ? OR link = ?",
+                (channel_id, channel_link.strip()),
+            )
+        else:
+            conn.execute("UPDATE channels SET is_active = 0 WHERE id = ?", (channel_id,))
         conn.commit()
 
 
