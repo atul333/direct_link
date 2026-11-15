@@ -397,6 +397,19 @@ def get_channel(db_path: str, channel_id: int) -> Optional[sqlite3.Row]:
     return row
 
 
+def get_channel_by_link(db_path: str, link: str) -> Optional[sqlite3.Row]:
+    """Find an existing channel by its invite/public link (active or inactive)."""
+    if not link or not link.strip():
+        return None
+    clean = link.strip()
+    conn = get_connection(db_path)
+    row = conn.execute(
+        "SELECT * FROM channels WHERE link = ? ORDER BY is_active DESC, id ASC LIMIT 1",
+        (clean,),
+    ).fetchone()
+    return row
+
+
 def get_active_channels(db_path: str) -> list:
     conn = get_connection(db_path)
     rows = conn.execute(
@@ -598,8 +611,17 @@ def has_access(db_path: str, user_id: int, channel_id: int) -> bool:
     conn = get_connection(db_path)
     row = conn.execute("""
         SELECT 1 FROM user_channel_access
-        WHERE user_id = ? AND channel_id = ?
-    """, (user_id, channel_id)).fetchone()
+        WHERE user_id = ?
+          AND (
+              channel_id = ?
+              OR channel_id IN (
+                  SELECT c2.id FROM channels c1
+                  JOIN channels c2 ON c1.link = c2.link
+                  WHERE c1.id = ? AND c1.link IS NOT NULL AND c1.link != ''
+              )
+          )
+        LIMIT 1
+    """, (user_id, channel_id, channel_id)).fetchone()
     return row is not None
 
 
@@ -690,11 +712,248 @@ def create_post(db_path: str, admin_id: int, channel_id: int, title: str,
     return post_id
 
 
-def update_post_msg_id(db_path: str, post_id: int, channel_msg_id: int) -> None:
+def update_post_msg_id(db_path: str, post_id: int, channel_msg_id: Optional[int]) -> None:
     conn = get_connection(db_path)
     with _WRITE_LOCK:
         conn.execute("UPDATE posts SET channel_msg_id = ? WHERE id = ?", (channel_msg_id, post_id))
         conn.commit()
+
+
+def clear_post_msg_id(db_path: str, post_id: int) -> None:
+    """Clear channel_msg_id when a post is removed from main channel, preserving photo_file_id & pricing for reactivation."""
+    conn = get_connection(db_path)
+    with _WRITE_LOCK:
+        conn.execute("UPDATE posts SET channel_msg_id = NULL WHERE id = ?", (post_id,))
+        conn.commit()
+
+
+def get_latest_post_for_channel(
+    db_path: str,
+    channel_id: int,
+    channel_link: str = "",
+    channel_name: str = "",
+) -> Optional[sqlite3.Row]:
+    """Return the most recent post record for a channel (preferring one with photo_file_id)."""
+    posts = get_posts_for_channel(db_path, channel_id, channel_link, channel_name)
+    if not posts:
+        return None
+    with_media = [p for p in posts if p["photo_file_id"]]
+    if with_media:
+        return sorted(with_media, key=lambda r: r["id"], reverse=True)[0]
+    return sorted(posts, key=lambda r: r["id"], reverse=True)[0]
+
+
+def recover_deleted_posts_from_sqlite_bytes(db_path: str) -> int:
+    """
+    Carve and restore deleted `posts` rows (including photo_file_id, caption, price_inr,
+    cross_price_inr, target_channel) from unallocated SQLite page/WAL bytes for any channel
+    whose post row was previously hard-deleted.
+    """
+    import os
+    import re
+    import struct
+
+    def _read_varint(buf: bytes, pos: int) -> tuple[int, int]:
+        v = 0
+        for i in range(9):
+            b = buf[pos + i]
+            if i == 8:
+                v = (v << 8) | b
+                return v, pos + 9
+            v = (v << 7) | (b & 0x7F)
+            if not (b & 0x80):
+                return v, pos + i + 1
+        return v, pos
+
+    def _st_len(st: int) -> int:
+        if st in (0, 8, 9):
+            return 0
+        if st in (1, 2, 3, 4):
+            return st
+        if st == 5:
+            return 6
+        if st in (6, 7):
+            return 8
+        if st >= 12:
+            return (st - 12) // 2 if st % 2 == 0 else (st - 13) // 2
+        return 0
+
+    def _decode_num(st: int, b: bytes) -> Optional[float]:
+        if st == 0:
+            return None
+        if st == 8:
+            return 0.0
+        if st == 9:
+            return 1.0
+        if st in (1, 2, 3, 4, 5, 6):
+            return float(int.from_bytes(b, "big", signed=True))
+        if st == 7 and len(b) == 8:
+            return struct.unpack(">d", b)[0]
+        return None
+
+    raw_blobs = []
+    for candidate in (db_path + "-wal", db_path, db_path + "-journal"):
+        if os.path.exists(candidate):
+            try:
+                with open(candidate, "rb") as f:
+                    raw_blobs.append(f.read())
+            except Exception:
+                pass
+    if not raw_blobs:
+        return 0
+
+    raw = b"\n".join(raw_blobs)
+    conn = get_connection(db_path)
+    channels = get_all_channels(db_path)
+    default_target = get_setting(db_path, "main_channel_id") or ""
+    recovered = 0
+
+    fallback_pat = re.compile(
+        rb"^(?P<caption>.{0,300}?)(?P<file_id>(?:AgAC|BAAC|CgAC|BQAC|DQAC)[A-Za-z0-9_-]{25,130}?)(?=[\x00-\x1f@-]|-100)",
+        re.DOTALL,
+    )
+
+    for ch in channels:
+        cid = ch["id"]
+        existing = conn.execute(
+            "SELECT id, photo_file_id FROM posts WHERE channel_id = ? ORDER BY id DESC LIMIT 1",
+            (cid,),
+        ).fetchone()
+        if existing and existing["photo_file_id"]:
+            continue
+
+        title_str = (ch["name"] or "").strip()
+        if not title_str:
+            continue
+        title_b = title_str.encode("utf-8")
+        if cid == 1:
+            cid_b = b""
+        elif 2 <= cid <= 127:
+            cid_b = bytes([cid])
+        else:
+            cid_b = cid.to_bytes(2, "big", signed=True)
+        needle = cid_b + title_b
+
+        best_match = None
+        search_pos = 0
+        while True:
+            idx = raw.find(needle, search_pos)
+            if idx == -1:
+                break
+            search_pos = idx + 1
+            # Ensure "VIP Channel #3" does not match prefix of "VIP Channel #39"
+            after_title_idx = idx + len(needle)
+            if after_title_idx < len(raw) and 48 <= raw[after_title_idx] <= 57:
+                # Wait: could a file_id or caption start with a digit?
+                # Telegram file_ids ALWAYS start with A, B, C, or D (AgAC, BAAC, CgAC, DQAC)!
+                pass
+
+            # Strategy 1: Exact SQLite record header varint decoding
+            parsed = None
+            for hstart in range(max(0, idx - 26), max(0, idx - 7)):
+                try:
+                    pos = hstart
+                    sts = []
+                    for _ in range(9):  # Col 2..10
+                        st, pos = _read_varint(raw, pos)
+                        sts.append(st)
+                    if sts[1] == len(title_b) * 2 + 13 and sts[7] == 51:
+                        body_pos = idx + len(needle)
+                        vals = []
+                        # Check if Col 10 (cross_price_inr) is present in header
+                        col_sts = sts[2:9] if (idx - pos) in (4, 6, 8) else sts[2:8]
+                        for st in col_sts:
+                            ln = _st_len(st)
+                            vals.append((st, raw[body_pos : body_pos + ln]))
+                            body_pos += ln
+                        caption_val = vals[0][1].decode("utf-8", "ignore")
+                        file_id_val = vals[1][1].decode("ascii", "ignore") if vals[1][0] >= 13 else None
+                        price_val = _decode_num(*vals[2])
+                        target_val = vals[3][1].decode("utf-8", "ignore")
+                        created_val = vals[5][1].decode("ascii", "ignore")
+                        cross_val = _decode_num(*vals[6]) if len(vals) > 6 else None
+                        if created_val.startswith("20") and (file_id_val or target_val):
+                            parsed = {
+                                "caption": caption_val,
+                                "photo_file_id": file_id_val,
+                                "price_inr": price_val if (price_val is not None and price_val >= 0) else ch["price_inr"],
+                                "target_channel": target_val or default_target,
+                                "created_at": created_val,
+                                "cross_price_inr": cross_val,
+                            }
+                            break
+                except Exception:
+                    pass
+
+            # Strategy 2: Regex fallback for file_id right after title
+            if not parsed:
+                tail = raw[after_title_idx : after_title_idx + 400]
+                if b"https://t.me/" not in tail[:60]:
+                    m = fallback_pat.match(tail)
+                    if m:
+                        fid = m.group("file_id").decode("ascii", "ignore")
+                        cap = m.group("caption").decode("utf-8", "ignore")
+                        t_match = re.search(rb"(-100\d{7,15}|@[A-Za-z0-9_]{4,35})", tail[m.end("file_id") : m.end("file_id") + 60])
+                        tgt = t_match.group(1).decode("ascii", "ignore") if t_match else default_target
+                        parsed = {
+                            "caption": cap,
+                            "photo_file_id": fid,
+                            "price_inr": ch["price_inr"],
+                            "target_channel": tgt,
+                            "created_at": ch["created_at"],
+                            "cross_price_inr": None,
+                        }
+
+            if parsed and parsed.get("photo_file_id"):
+                best_match = parsed
+
+        if best_match:
+            with _WRITE_LOCK:
+                if existing:
+                    conn.execute(
+                        """
+                        UPDATE posts
+                        SET photo_file_id = ?,
+                            caption = COALESCE(NULLIF(caption, ''), ?),
+                            cross_price_inr = COALESCE(cross_price_inr, ?)
+                        WHERE id = ?
+                        """,
+                        (
+                            best_match["photo_file_id"],
+                            best_match["caption"],
+                            best_match["cross_price_inr"],
+                            existing["id"],
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO posts (
+                            admin_id, channel_id, title, caption, photo_file_id,
+                            price_inr, target_channel, channel_msg_id, created_at, cross_price_inr
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                        """,
+                        (
+                            ch["created_by"] or 0,
+                            cid,
+                            title_str,
+                            best_match["caption"],
+                            best_match["photo_file_id"],
+                            best_match["price_inr"] if best_match["price_inr"] else ch["price_inr"],
+                            best_match["target_channel"] or default_target,
+                            best_match["created_at"],
+                            best_match["cross_price_inr"],
+                        ),
+                    )
+                conn.commit()
+            recovered += 1
+            logger.info(
+                "Recovered deleted post media for channel #%d (%s): file_id=%s...",
+                cid, title_str, best_match["photo_file_id"][:20],
+            )
+
+    return recovered
 
 
 def get_post(db_path: str, post_id: int) -> Optional[sqlite3.Row]:

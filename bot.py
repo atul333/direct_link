@@ -1282,13 +1282,13 @@ async def cleanup_dead_channel(bot, channel: dict, reason: str) -> int:
                     p["id"], msg_id, target
                 )
                 deleted_posts_count += 1
-                await asyncio.to_thread(db.delete_post, DB_PATH, p["id"])
+                await asyncio.to_thread(db.clear_post_msg_id, DB_PATH, p["id"])
             except Exception as exc:
                 err_str = str(exc)
                 if "message to delete not found" in err_str.lower():
                     logger.info("Promotional post msg_id=%s was already deleted from %s", msg_id, target)
                     deleted_posts_count += 1
-                    await asyncio.to_thread(db.delete_post, DB_PATH, p["id"])
+                    await asyncio.to_thread(db.clear_post_msg_id, DB_PATH, p["id"])
                 else:
                     logger.warning(
                         "Could not delete message %s from %s for post %d: %s",
@@ -1308,7 +1308,7 @@ async def cleanup_dead_channel(bot, channel: dict, reason: str) -> int:
 
     # 5. Build informative admin alert
     if deleted_posts_count > 0:
-        cleanup_status = f"✅ Deleted <b>{deleted_posts_count}</b> post(s) from main channel"
+        cleanup_status = f"✅ Deleted <b>{deleted_posts_count}</b> post(s) from main channel (image & post data saved for 1-click reactivation)"
     elif post_notes:
         cleanup_status = f"⚠️ Could not delete message from channel:\n" + "\n".join(f"• {n}" for n in post_notes)
     else:
@@ -1330,20 +1330,210 @@ async def cleanup_dead_channel(bot, channel: dict, reason: str) -> int:
         f"✅ Channel deactivated (is_active=0)\n"
         f"✅ Existing user purchases preserved in database\n"
         f"✅ Access to post links blocked (users cannot purchase dead link)\n\n"
-        f"💡 <i>To update the link and reactivate: <code>/editchannel</code></i>\n"
-        f"💡 <i>To delete any lingering post manually: <code>/delpost [message_id]</code></i>"
+        f"💡 <i>Tap the button below or use <code>/reactivate</code> / <code>/editchannel</code> to reactivate and re-send the post (with its image) to the Main Channel!</i>"
     )
+    alert_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🟢 Reactivate & Repost {channel_name} to Main Channel", callback_data=f"reactivate_ch:{channel_id}")]
+    ])
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
                 chat_id=admin_id,
                 text=alert_msg,
                 parse_mode=ParseMode.HTML,
+                reply_markup=alert_kb,
             )
         except Exception as exc:
             logger.warning("Failed to notify admin %d of channel cleanup: %s", admin_id, exc)
 
     return deleted_posts_count
+
+
+async def republish_channel_post(
+    bot,
+    channel_id: int,
+    custom_photo_file_id: Optional[str] = None,
+    custom_media_type: Optional[str] = None,
+    allow_text_only: bool = False,
+) -> tuple[bool, str, Optional[int]]:
+    """
+    Reactivates a channel (keeping the same channel_id so all previous buyers retain access
+    and never see a QR code again) and re-publishes its promotional post (with its original
+    deleted photo/video, price, and buy button) to the Main Channel.
+
+    Returns (success: bool, status_or_error: str, message_id: Optional[int]).
+    If no saved photo/video is found and allow_text_only is False, returns (False, "NEED_MEDIA", None).
+    """
+    channel = await asyncio.to_thread(db.get_channel, DB_PATH, channel_id)
+    if not channel:
+        return False, "Channel not found in database.", None
+
+    # 1. Reactivate channel in DB so existing buyers and new buyers can access it
+    await asyncio.to_thread(db.update_channel, DB_PATH, channel_id, is_active=1)
+    invalidate_channel_cache()
+
+    # 2. Fetch latest post record for this channel (or recover from SQLite raw bytes if previously deleted)
+    post = await asyncio.to_thread(
+        db.get_latest_post_for_channel, DB_PATH, channel_id, row_get(channel, "link", ""), channel["name"]
+    )
+    if not post or not post["photo_file_id"]:
+        await asyncio.to_thread(db.recover_deleted_posts_from_sqlite_bytes, DB_PATH)
+        post = await asyncio.to_thread(
+            db.get_latest_post_for_channel, DB_PATH, channel_id, row_get(channel, "link", ""), channel["name"]
+        )
+
+    photo_file_id = custom_photo_file_id or (post["photo_file_id"] if post else None)
+    if not photo_file_id and not allow_text_only:
+        return False, "NEED_MEDIA", None
+
+    default_main = await asyncio.to_thread(db.get_setting, DB_PATH, "main_channel_id") or MAIN_CHANNEL_ID
+    target = (post["target_channel"] if post and post["target_channel"] else None) or default_main
+    if not target:
+        return False, "No Main Channel configured. Use /setmainchannel first.", None
+
+    price = (post["price_inr"] if post and post["price_inr"] is not None else channel["price_inr"]) or 0.0
+    if price <= 0 and channel["price_inr"] > 0:
+        price = channel["price_inr"]
+    cross_price = row_get(post, "cross_price_inr") if post else None
+    custom_text = (post["caption"] if post and post["caption"] else "") or ""
+    is_free = price <= 0
+    ch_name = channel["name"]
+
+    # 3. Ensure a post entry exists in DB linked to this exact channel_id
+    if post:
+        post_id = post["id"]
+        if custom_photo_file_id:
+            conn = db.get_connection(DB_PATH)
+            conn.execute("UPDATE posts SET photo_file_id = ? WHERE id = ?", (custom_photo_file_id, post_id))
+            conn.commit()
+    else:
+        admin_id = row_get(channel, "created_by") or (ADMIN_IDS[0] if ADMIN_IDS else 0)
+        post_id = await asyncio.to_thread(
+            db.create_post,
+            DB_PATH,
+            admin_id,
+            channel_id,
+            ch_name,
+            custom_text,
+            photo_file_id,
+            price,
+            target,
+            None,
+            cross_price,
+        )
+
+    # 4. Build caption & inline keyboard pointing to buy_{post_id} (linked to same channel_id!)
+    bot_username = BOT_USERNAME
+    if is_free:
+        header_block = (
+            f"<blockquote><b>🎁 EXCLUSIVE FREE VIP CHANNEL ACCESS 🎁</b></blockquote>\n"
+            + (f"<blockquote>{custom_text}</blockquote>\n" if custom_text else "")
+        )
+        price_line = "💰 <b>Access Fee:</b> <b>FREE (₹0) 🎁</b>\n"
+        payment_mode_line = "⚡ <b>Instant Access:</b> Zero Payment • 100% Free Join"
+        action_line = "👇 <b>Tap the button below to join for free:</b>"
+        channel_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚀 Join Free Channel Now 🔓", url=channel["link"])]
+        ])
+    else:
+        header_block = (
+            f"<blockquote><b>🔥 EXCLUSIVE VIP CHANNEL ACCESS 🔥</b></blockquote>\n"
+            + (f"<blockquote>{custom_text}</blockquote>\n" if custom_text else "")
+        )
+        if cross_price and cross_price > 0:
+            price_line = f"💰 <b>Access Fee:</b> <b>₹{price:.0f}</b> <s>₹{cross_price:.0f}</s> <i>(Limited Time Offer)</i>\n"
+        else:
+            price_line = f"💰 <b>Access Fee:</b> <b>₹{price:.0f}</b> <i>(Limited Time Offer)</i>\n"
+        payment_mode_line = "📲 <b>Payment Mode:</b> Any UPI App (PhonePe, GPay, Paytm, BHIM)"
+        action_line = "👇 <b>Tap the button below to unlock instant VIP access:</b>"
+        channel_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"⚡ Unlock Instant Access — ₹{price:.0f} 🔓",
+                url=f"https://t.me/{bot_username}?start=buy_{post_id}",
+            )]
+        ])
+
+    final_caption = (
+        f"{header_block}"
+        f"<blockquote><b>🌟 Channel:</b> <b>{ch_name}</b>\n"
+        f"──────────────────────────\n"
+        f"{price_line}"
+        f"{payment_mode_line}</blockquote>\n"
+        f"<blockquote>⚠️ <b>ONE-TIME LINK — NO BACKUP AVAILABLE</b></blockquote>\n\n"
+        f"{action_line}"
+    )
+    if photo_file_id and len(final_caption) > 1024:
+        final_caption = final_caption[:1020] + "..."
+
+    # 5. Send to Main Channel (auto-detecting Photo / Video / Animation file_id)
+    try:
+        try:
+            target_chat_id = int(target)
+        except (ValueError, TypeError):
+            target_chat_id = target
+
+        msg = None
+        if photo_file_id:
+            if custom_media_type == "video" or photo_file_id.startswith(("BAAC", "BQAC", "DQAC")):
+                send_order = ("video", "photo", "animation")
+            elif custom_media_type == "animation" or photo_file_id.startswith("CgAC"):
+                send_order = ("animation", "video", "photo")
+            else:
+                send_order = ("photo", "video", "animation")
+
+            last_err = None
+            for mtype in send_order:
+                try:
+                    if mtype == "video":
+                        msg = await bot.send_video(
+                            chat_id=target_chat_id,
+                            video=photo_file_id,
+                            caption=final_caption,
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=channel_keyboard,
+                        )
+                    elif mtype == "animation":
+                        msg = await bot.send_animation(
+                            chat_id=target_chat_id,
+                            animation=photo_file_id,
+                            caption=final_caption,
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=channel_keyboard,
+                        )
+                    else:
+                        msg = await bot.send_photo(
+                            chat_id=target_chat_id,
+                            photo=photo_file_id,
+                            caption=final_caption,
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=channel_keyboard,
+                        )
+                    break
+                except Exception as media_exc:
+                    last_err = media_exc
+                    continue
+
+            if msg is None:
+                logger.warning("Could not send recovered media (%s), falling back to text: %s", photo_file_id[:20], last_err)
+                msg = await bot.send_message(
+                    chat_id=target_chat_id,
+                    text=final_caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=channel_keyboard,
+                )
+        else:
+            msg = await bot.send_message(
+                chat_id=target_chat_id,
+                text=final_caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=channel_keyboard,
+            )
+
+        await asyncio.to_thread(db.update_post_msg_id, DB_PATH, post_id, msg.message_id)
+        return True, str(target), msg.message_id
+    except Exception as exc:
+        logger.error("Failed to republish post for channel #%d to %s: %s", channel_id, target, exc)
+        return False, str(exc), None
 
 
 async def channel_link_monitor_worker(bot) -> None:
@@ -2589,20 +2779,35 @@ async def cb_edit_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     channel_id = int(query.data.split(":")[1])
     ctx.user_data["edit_channel_id"] = channel_id
     channel = db.get_channel(DB_PATH, channel_id)
+    if not channel:
+        await query.edit_message_text("❌ Channel not found.")
+        return ConversationHandler.END
 
-    keyboard = InlineKeyboardMarkup([
+    buttons = [
         [InlineKeyboardButton("📛 Name",        callback_data="edit_field:name")],
         [InlineKeyboardButton("🔗 Link",        callback_data="edit_field:link")],
         [InlineKeyboardButton("💰 Price (₹)",   callback_data="edit_field:price_inr")],
         [InlineKeyboardButton("📝 Description", callback_data="edit_field:description")],
         [InlineKeyboardButton("🛡️ Chat ID",     callback_data="edit_field:chat_id")],
-        [InlineKeyboardButton(
-            "🟢 Activate" if not channel["is_active"] else "🔴 Deactivate",
-            callback_data="edit_field:toggle_active"
-        )],
-    ])
+    ]
+    if not channel["is_active"]:
+        buttons.append([
+            InlineKeyboardButton("🟢 Activate & Repost to Main Channel", callback_data="edit_field:toggle_active")
+        ])
+    else:
+        buttons.append([
+            InlineKeyboardButton("📢 Repost to Main Channel (Keep Buyers)", callback_data="edit_field:repost_main")
+        ])
+        buttons.append([
+            InlineKeyboardButton("🔴 Deactivate", callback_data="edit_field:toggle_active")
+        ])
+
+    keyboard = InlineKeyboardMarkup(buttons)
+    status_str = "✅ Active" if channel["is_active"] else "❌ Inactive"
     await query.edit_message_text(
-        f"Editing: <b>{channel['name']}</b>\nWhat do you want to change?",
+        f"Editing: <b>{channel['name']}</b> (ID: <code>#{channel_id}</code> — {status_str})\n"
+        f"Link: <code>{channel['link']}</code>\n\n"
+        f"What do you want to change?",
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
     )
@@ -2616,17 +2821,59 @@ async def cb_edit_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data["edit_field"] = field
     channel_id = ctx.user_data["edit_channel_id"]
 
-    if field == "toggle_active":
+    if field in ("toggle_active", "repost_main"):
         channel = db.get_channel(DB_PATH, channel_id)
-        new_state = 0 if channel["is_active"] else 1
-        db.update_channel(DB_PATH, channel_id, is_active=new_state)
-        state_str = "activated ✅" if new_state else "deactivated ❌"
-        await query.edit_message_text(f"Channel {state_str}.")
+        if not channel:
+            await query.edit_message_text("❌ Channel not found.")
+            return ConversationHandler.END
+
+        if field == "toggle_active" and channel["is_active"]:
+            db.update_channel(DB_PATH, channel_id, is_active=0)
+            invalidate_channel_cache()
+            await query.edit_message_text(f"🔴 Channel <b>{channel['name']}</b> deactivated ❌", parse_mode=ParseMode.HTML)
+            return ConversationHandler.END
+
+        # Reactivating (or reposting to Main Channel): activate & republish post with original image!
+        await query.edit_message_text(
+            f"⏳ Reactivating <b>{channel['name']}</b> and sending post to Main Channel...",
+            parse_mode=ParseMode.HTML,
+        )
+        ok, info, msg_id = await republish_channel_post(ctx.bot, channel_id)
+        if ok:
+            await query.edit_message_text(
+                f"✅ <b>{channel['name']} Activated & Posted to Main Channel!</b>\n\n"
+                f"• <b>Channel ID:</b> <code>#{channel_id}</code>\n"
+                f"• <b>Main Channel:</b> <code>{info}</code> (Message ID: <code>{msg_id}</code>)\n"
+                f"• <b>Previous Buyers:</b> Kept! (They directly receive the channel link — no QR code)\n"
+                f"• <b>New Users:</b> Shown QR code to purchase",
+                parse_mode=ParseMode.HTML,
+            )
+            ctx.user_data.clear()
+            return ConversationHandler.END
+
+        if info == "NEED_MEDIA":
+            ctx.user_data["edit_field"] = "repost_media"
+            await query.edit_message_text(
+                f"🟢 <b>{channel['name']} (ID #{channel_id}) is now Active!</b>\n\n"
+                f"📸🎬 <b>Send the Photo or Video</b> to publish this channel's post to the Main Channel "
+                f"(or type <code>skip</code> for a text-only post):\n\n"
+                f"✨ <i>Uses the exact same Channel ID (<code>#{channel_id}</code>), so all previous buyers "
+                f"automatically get the direct channel link without seeing a QR code!</i>",
+                parse_mode=ParseMode.HTML,
+            )
+            return EC_VALUE
+
+        await query.edit_message_text(
+            f"🟢 <b>{channel['name']}</b> is now Active ✅, but could not auto-post to Main Channel:\n"
+            f"<code>{info}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        ctx.user_data.clear()
         return ConversationHandler.END
 
     labels = {
         "name": "new name",
-        "link": "new invite link",
+        "link": "new invite link (will also reactivate & repost if inactive)",
         "price_inr": "new price in ₹",
         "description": "new description",
         "chat_id": "Channel Chat ID (e.g. -1001234567890 or type 'none' to remove)",
@@ -2638,7 +2885,55 @@ async def cb_edit_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def ec_get_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     field = ctx.user_data.get("edit_field")
     channel_id = ctx.user_data.get("edit_channel_id")
-    value = update.message.text.strip()
+    msg = update.message
+
+    if field == "repost_media":
+        photo_file_id = None
+        media_type = None
+        if msg.photo:
+            photo_file_id = msg.photo[-1].file_id
+            media_type = "photo"
+        elif msg.video:
+            photo_file_id = msg.video.file_id
+            media_type = "video"
+        elif msg.animation:
+            photo_file_id = msg.animation.file_id
+            media_type = "animation"
+        elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("video/"):
+            photo_file_id = msg.document.file_id
+            media_type = "video"
+        elif msg.text and msg.text.strip().lower() in ("skip", "/skip"):
+            photo_file_id = None
+        else:
+            await msg.reply_text("⚠️ Please send a Photo, Video, or type <code>skip</code>.", parse_mode=ParseMode.HTML)
+            return EC_VALUE
+
+        ok, info, msg_id = await republish_channel_post(
+            ctx.bot,
+            channel_id,
+            custom_photo_file_id=photo_file_id,
+            custom_media_type=media_type,
+            allow_text_only=True,
+        )
+        ctx.user_data.clear()
+        if ok:
+            await msg.reply_text(
+                f"🎉 <b>Post Published to Main Channel!</b>\n\n"
+                f"• <b>Channel ID:</b> <code>#{channel_id}</code>\n"
+                f"• <b>Target Channel:</b> <code>{info}</code> (Message ID: <code>{msg_id}</code>)\n"
+                f"• <b>Previous Buyers:</b> Kept! (Direct link sent — no QR code)\n"
+                f"• <b>New Users:</b> Shown QR code to purchase",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await msg.reply_text(f"❌ Could not publish post: <code>{info}</code>", parse_mode=ParseMode.HTML)
+        return ConversationHandler.END
+
+    if not msg.text:
+        await msg.reply_text("⚠️ Please enter text.")
+        return EC_VALUE
+
+    value = msg.text.strip()
 
     if field == "price_inr":
         try:
@@ -2650,10 +2945,191 @@ async def ec_get_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if value.lower() in ("none", "clear", "skip"):
             value = None
 
-    db.update_channel(DB_PATH, channel_id, **{field: value})
+    was_channel = db.get_channel(DB_PATH, channel_id)
+    was_inactive = was_channel and not was_channel["is_active"]
+
+    if field == "link":
+        db.update_channel(DB_PATH, channel_id, link=value, is_active=1)
+        invalidate_channel_cache()
+        if was_inactive:
+            ok, info, msg_id = await republish_channel_post(ctx.bot, channel_id)
+            if ok:
+                ctx.user_data.clear()
+                await update.message.reply_text(
+                    f"✅ <b>Link updated, channel reactivated, and post re-published to Main Channel!</b>\n\n"
+                    f"• <b>Target Channel:</b> <code>{info}</code> (Message ID: <code>{msg_id}</code>)\n"
+                    f"• <b>Previous Buyers:</b> Kept! (No QR code shown to existing buyers)",
+                    parse_mode=ParseMode.HTML,
+                )
+                return ConversationHandler.END
+    else:
+        db.update_channel(DB_PATH, channel_id, **{field: value})
+        invalidate_channel_cache()
+
     ctx.user_data.clear()
-    await update.message.reply_text(f"✅ Channel updated successfully!")
+    await update.message.reply_text(
+        "✅ <b>Channel updated successfully!</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Repost to Main Channel Now", callback_data=f"reactivate_ch:{channel_id}")]
+        ]),
+    )
     return ConversationHandler.END
+
+
+async def cmd_reactivate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command /reactivate to one-click reactivate & repost deleted channels to Main Channel."""
+    if not is_admin(update.effective_user.id):
+        return
+
+    await asyncio.to_thread(db.recover_deleted_posts_from_sqlite_bytes, DB_PATH)
+    channels = await asyncio.to_thread(db.get_all_channels, DB_PATH)
+    if not channels:
+        await update.message.reply_text("ℹ️ No channels found in database.")
+        return
+
+    conn = db.get_connection(DB_PATH)
+    post_rows = conn.execute(
+        "SELECT channel_id, MAX(id) as pid, MAX(channel_msg_id) as msg_id, MAX(photo_file_id) as fid FROM posts GROUP BY channel_id"
+    ).fetchall()
+    post_map = {r["channel_id"]: r for r in post_rows}
+
+    needs_repost = []
+    other_channels = []
+    for c in channels:
+        cid = c["id"]
+        pr = post_map.get(cid)
+        is_act = bool(c["is_active"])
+        has_live_msg = bool(pr and pr["msg_id"])
+        has_img = bool(pr and pr["fid"])
+        if not is_act or not has_live_msg:
+            needs_repost.append((c, is_act, has_img))
+        else:
+            other_channels.append((c, is_act, has_img))
+
+    buttons = []
+    if needs_repost:
+        buttons.append([
+            InlineKeyboardButton(
+                f"🚀 Restore & Repost All ({len(needs_repost)}) Missing Posts Now",
+                callback_data="reactivate_ch:all",
+            )
+        ])
+        for c, is_act, has_img in needs_repost[:25]:
+            img_tag = "🖼️" if has_img else "📝"
+            st_tag = "🔴" if not is_act else "⚠️"
+            buttons.append([
+                InlineKeyboardButton(
+                    f"{st_tag} {img_tag} Reactivate & Repost: {c['name']} (₹{c['price_inr']:.0f})",
+                    callback_data=f"reactivate_ch:{c['id']}",
+                )
+            ])
+
+    for c, is_act, has_img in other_channels[-10:]:
+        img_tag = "🖼️" if has_img else "📝"
+        buttons.append([
+            InlineKeyboardButton(
+                f"✅ {img_tag} Repost Again: {c['name']} (₹{c['price_inr']:.0f})",
+                callback_data=f"reactivate_ch:{c['id']}",
+            )
+        ])
+
+    await update.message.reply_text(
+        "🔄 <b>Reactivate & Repost Channels to Main Channel</b>\n\n"
+        "• Tap any channel below to <b>reactivate it and re-send its post (with original image & price)</b> to the Main Channel.\n"
+        "• <b>Previous Buyers Protected:</b> Users who already bought that channel will <b>directly receive the channel link</b> (no QR code).\n"
+        "• <b>New Users:</b> Will receive a QR code to purchase.\n\n"
+        f"📊 <b>Channels missing a Main Channel post:</b> <code>{len(needs_repost)}</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
+    )
+
+
+async def cb_reactivate_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle one-click Reactivate & Repost button from /reactivate, /editchannel, or admin alerts."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return
+
+    arg = query.data.split(":", 1)[1]
+    if arg == "all":
+        await asyncio.to_thread(db.recover_deleted_posts_from_sqlite_bytes, DB_PATH)
+        channels = await asyncio.to_thread(db.get_all_channels, DB_PATH)
+        conn = db.get_connection(DB_PATH)
+        post_rows = conn.execute(
+            "SELECT channel_id, MAX(channel_msg_id) as msg_id, MAX(photo_file_id) as fid FROM posts GROUP BY channel_id"
+        ).fetchall()
+        post_map = {r["channel_id"]: r for r in post_rows}
+
+        targets = [
+            c for c in channels
+            if (not c["is_active"]) or (c["id"] in post_map and not post_map[c["id"]]["msg_id"])
+        ]
+        if not targets:
+            await query.edit_message_text("✅ All channels with saved posts are already active and posted!")
+            return
+
+        await query.edit_message_text(
+            f"⏳ <b>Restoring & re-publishing {len(targets)} channel(s) to Main Channel...</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        restored = []
+        need_media = []
+        for c in targets:
+            ok, info, msg_id = await republish_channel_post(ctx.bot, c["id"])
+            if ok:
+                restored.append(f"✅ <b>{c['name']}</b> (Msg #{msg_id})")
+                await asyncio.sleep(1.0)
+            elif info == "NEED_MEDIA":
+                need_media.append(f"📸 <b>{c['name']}</b> (use /editchannel → select {c['name']} → Repost to attach image)")
+            else:
+                need_media.append(f"⚠️ <b>{c['name']}</b>: {info}")
+
+        summary = [f"🎉 <b>Repost Complete! ({len(restored)}/{len(targets)} published)</b>\n"]
+        if restored:
+            summary.append("\n".join(restored))
+        if need_media:
+            summary.append("\n<b>Needs Image / Attention:</b>\n" + "\n".join(need_media))
+        summary.append(
+            "\n\n✅ <i>All previous buyers retain their access and will directly get the link without seeing a QR code!</i>"
+        )
+        await query.edit_message_text("\n".join(summary), parse_mode=ParseMode.HTML)
+        return
+
+    channel_id = int(arg)
+    channel = await db_get_channel(channel_id)
+    if not channel:
+        await query.edit_message_text("❌ Channel not found.")
+        return
+
+    await query.edit_message_text(
+        f"⏳ Reactivating <b>{channel['name']}</b> and sending post to Main Channel...",
+        parse_mode=ParseMode.HTML,
+    )
+    ok, info, msg_id = await republish_channel_post(ctx.bot, channel_id)
+    if ok:
+        await query.edit_message_text(
+            f"✅ <b>{channel['name']} Activated & Re-Posted to Main Channel!</b>\n\n"
+            f"• <b>Channel ID:</b> <code>#{channel_id}</code>\n"
+            f"• <b>Main Channel:</b> <code>{info}</code> (Message ID: <code>{msg_id}</code>)\n"
+            f"• <b>Previous Buyers:</b> Protected! (They directly get the channel link — no QR code)\n"
+            f"• <b>New Users:</b> Shown QR code to purchase",
+            parse_mode=ParseMode.HTML,
+        )
+    elif info == "NEED_MEDIA":
+        await query.edit_message_text(
+            f"🟢 <b>{channel['name']} (ID #{channel_id}) is now Active!</b>\n\n"
+            f"ℹ️ The original image was not found in cache. To post with an image while keeping all previous buyers:\n"
+            f"1. Run <code>/editchannel</code> → select <b>{channel['name']}</b> → tap <b>📢 Repost to Main Channel</b> and send the image,\n"
+            f"2. Or run <code>/post</code> and select <b>{channel['name']}</b> (or paste the same link)!",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await query.edit_message_text(
+            f"⚠️ Channel activated, but could not post to Main Channel: <code>{info}</code>",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -3301,23 +3777,32 @@ async def post_get_channel_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
         )
         return POST_CHANNEL
 
-    admin_id = update.effective_user.id
-    count = len(db.get_all_channels(DB_PATH)) + 1
-    channel_name = f"VIP Channel #{count}"
+    existing_ch = db.get_channel_by_link(DB_PATH, link)
+    if existing_ch:
+        channel_id = existing_ch["id"]
+        channel_name = existing_ch["name"]
+        db.update_channel(DB_PATH, channel_id, is_active=1)
+        invalidate_channel_cache()
+        ctx.user_data["post_channel_id"] = channel_id
+        ctx.user_data["channel_default_price"] = existing_ch["price_inr"] or 0.0
+    else:
+        admin_id = update.effective_user.id
+        count = len(db.get_all_channels(DB_PATH)) + 1
+        channel_name = f"VIP Channel #{count}"
 
-    # Automatically save channel to database with attractive emoji description
-    channel_id = db.add_channel(
-        DB_PATH,
-        name=channel_name,
-        link=link,
-        price_inr=0.0,
-        description="🌟 Exclusive VIP Access • Daily Premium Content & Updates 🚀",
-        admin_id=admin_id,
-    )
-    invalidate_channel_cache()
+        # Automatically save channel to database with attractive emoji description
+        channel_id = db.add_channel(
+            DB_PATH,
+            name=channel_name,
+            link=link,
+            price_inr=0.0,
+            description="🌟 Exclusive VIP Access • Daily Premium Content & Updates 🚀",
+            admin_id=admin_id,
+        )
+        invalidate_channel_cache()
 
-    ctx.user_data["post_channel_id"] = channel_id
-    ctx.user_data["channel_default_price"] = 0.0
+        ctx.user_data["post_channel_id"] = channel_id
+        ctx.user_data["channel_default_price"] = 0.0
 
     if ctx.user_data.get("is_free"):
         ctx.user_data["post_price"] = 0.0
@@ -3941,23 +4426,46 @@ async def post_init(app: Application) -> None:
     except Exception as exc:
         logger.error("Failed to start webhook server on port %d: %s", WEBHOOK_PORT, exc)
 
-    # 2. Auto-recover any valid channels that were falsely deactivated
+    # 2. Auto-recover deleted post images from SQLite bytes & reactivate falsely deactivated invite channels
     try:
+        carved_count = await asyncio.to_thread(db.recover_deleted_posts_from_sqlite_bytes, DB_PATH)
+        if carved_count:
+            logger.info("Recovered %d deleted post record(s) (with photo/video file_ids) from SQLite storage.", carved_count)
+
         all_channels = await asyncio.to_thread(db.get_all_channels, DB_PATH)
         recovered_count = 0
+        reposted_count = 0
         for ch in all_channels:
-            if not row_get(ch, "is_active", 1):
-                link = (row_get(ch, "link") or "").strip()
-                if "/+" in link or "joinchat" in link:
-                    await asyncio.to_thread(db.update_channel, DB_PATH, ch["id"], is_active=1)
-                    recovered_count += 1
-                    logger.info(
-                        "Auto-reactivated invite channel #%d (%s): %s",
-                        ch["id"], ch["name"], link,
-                    )
-        if recovered_count:
+            link = (row_get(ch, "link") or "").strip()
+            is_invite_link = "/+" in link or "joinchat" in link
+            was_inactive = not row_get(ch, "is_active", 1)
+            if was_inactive and is_invite_link:
+                await asyncio.to_thread(db.update_channel, DB_PATH, ch["id"], is_active=1)
+                recovered_count += 1
+                logger.info(
+                    "Auto-reactivated invite channel #%d (%s): %s",
+                    ch["id"], ch["name"], link,
+                )
+            # If this invite channel had its post removed from the Main Channel, auto-repost it with its recovered image!
+            if is_invite_link:
+                latest_post = await asyncio.to_thread(
+                    db.get_latest_post_for_channel, DB_PATH, ch["id"], link, ch["name"]
+                )
+                if latest_post and latest_post["photo_file_id"] and not latest_post["channel_msg_id"]:
+                    ok, info, msg_id = await republish_channel_post(app.bot, ch["id"])
+                    if ok:
+                        reposted_count += 1
+                        logger.info(
+                            "Auto-republished recovered post for channel #%d (%s) to %s (msg_id=%s)",
+                            ch["id"], ch["name"], info, msg_id,
+                        )
+                        await asyncio.sleep(1.0)
+        if recovered_count or reposted_count:
             invalidate_channel_cache()
-            logger.info("Restored %d falsely deactivated channel(s) to active status.", recovered_count)
+            logger.info(
+                "Startup recovery complete: %d channel(s) reactivated, %d post(s) re-published to Main Channel.",
+                recovered_count, reposted_count,
+            )
     except Exception as exc:
         logger.warning("Could not run channel recovery in post_init: %s", exc)
 
@@ -3979,6 +4487,7 @@ async def post_init(app: Application) -> None:
     admin_cmds = user_cmds + [
         BotCommand("post", "Create & broadcast paid post to Main Channel"),
         BotCommand("postfree", "Create & broadcast FREE channel post (no payment)"),
+        BotCommand("reactivate", "Reactivate & repost deleted channels with original image"),
         BotCommand("posts", "List broadcast posts"),
         BotCommand("delpost", "Delete a specific post from channel"),
         BotCommand("setmainchannel", "Set default main channel"),
@@ -4169,7 +4678,14 @@ def main() -> None:
                 CallbackQueryHandler(cb_edit_select, pattern=r"^edit_select:"),
                 CallbackQueryHandler(cb_edit_field, pattern=r"^edit_field:"),
             ],
-            EC_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ec_get_value)],
+            EC_VALUE: [
+                MessageHandler(
+                    filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.VIDEO,
+                    ec_get_value,
+                ),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ec_get_value),
+                CommandHandler("skip", ec_get_value),
+            ],
         },
         fallbacks=[cancel_handler],
         per_message=False,
@@ -4229,6 +4745,7 @@ def main() -> None:
     app.add_handler(CommandHandler("setchatid",      cmd_setchatid))
     app.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, handle_admin_forward))
     app.add_handler(CommandHandler("channels",       cmd_channels))
+    app.add_handler(CommandHandler(["reactivate", "restore", "repost"], cmd_reactivate))
     app.add_handler(CommandHandler("delchannel",     cmd_delchannel))
     app.add_handler(CommandHandler("grantaccess",    cmd_grantaccess))
     app.add_handler(CommandHandler("stats",          cmd_stats))
@@ -4247,6 +4764,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_check_payment, pattern=r"^check_?pay:"))
     app.add_handler(CallbackQueryHandler(cb_adm_force_pay, pattern=r"^adm_force_pay:"))
     app.add_handler(CallbackQueryHandler(cb_del_channel,   pattern=r"^del_channel:"))
+    app.add_handler(CallbackQueryHandler(cb_reactivate_channel, pattern=r"^reactivate_ch:"))
     app.add_handler(CallbackQueryHandler(cb_del_fwd_post,  pattern=r"^del_fwd_post:"))
     app.add_handler(CallbackQueryHandler(cb_link_chatid,   pattern=r"^link_cid:"))
     app.add_handler(CallbackQueryHandler(cb_back_menu,     pattern=r"^back_menu$"))
