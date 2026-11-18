@@ -270,68 +270,57 @@ def rzp_client() -> razorpay.Client:
 
 _ADULT_MENU_EMOJIS = [
     "🔞", "🍑", "🥵", "💦", "🍒", "💋", "👅", "🍆",
-    "🔥", "😈", "👙", "👠", "💃", "🌶️", "🫦", "❤️‍🔥",
-    "🍓", "🍌", "🥂", "🦊",
+    "🔥", "😈", "👙", "👠", "💃", "🌶️", "🫦", "🍓",
+    "🍌", "🥂", "🦊", "😏",
 ]
-_ADULT_TRAIL_EMOJIS = [
-    "🔥", "💦", "💋", "🥵", "😈", "🍑", "🌶️", "🔞", "🍒", "🫦",
-]
+
+# Strip decorative emojis from channel title while preserving squared Latin letters (e.g. 🅳🅴🆂🅸)
+_STRIP_TITLE_EMOJIS_RE = re.compile(
+    r"[\U0001F190-\U0010FFFF\U0001F000-\U0001F16F\u2600-\u27BF\uFE0F\u200D]+"
+)
 
 
 def _format_media_badge(media_counts: str) -> str:
-    """Format photo and video counts into a compact badge for /menu buttons."""
+    """Extract and format ONLY the video count (no images/photos count and no extra emojis)."""
     raw = (media_counts or "").strip()
     if not raw:
         return ""
-    m_p = re.search(r"(\d[\d,\s.]*[kKmM]?)\s*(?:photos?|p[hH]?[oO0][tT][oO0]s?|pics?)\b", raw, re.IGNORECASE)
-    m_v = re.search(r"(\d[\d,\s.]*[kKmM]?)\s*(?:videos?|v[iI1l!|]?[dD][eEcC0oO][oO0]?s?|vids?)\b", raw, re.IGNORECASE)
-    p_num = re.sub(r"[\s,]+", "", m_p.group(1)) if m_p else ""
-    v_num = re.sub(r"[\s,]+", "", m_v.group(1)) if m_v else ""
-    if p_num and v_num:
-        return f"📸 {p_num} • 🎬 {v_num} Videos"
+    m_v = re.search(
+        r"(\d[\d,\s.]*[kKmM]?)\s*(?:videos?|v[iI1l!|]?[dD][eEcC0oO][oO0]?s?|vids?)\b"
+        r"|\b(?:videos?|vids?)\s*[:\-]?\s*(\d[\d,\s.]*[kKmM]?)",
+        raw,
+        re.IGNORECASE,
+    )
+    v_num = re.sub(r"[\s,]+", "", (m_v.group(1) or m_v.group(2) or "")) if m_v else ""
     if v_num:
-        return f"🎬 {v_num} Videos"
-    if p_num:
-        return f"📸 {p_num} Photos"
-    return raw
+        return f"{v_num} Videos"
+    return ""
 
 
 def format_channel_menu_label(c, index: int = 1) -> str:
     """
     Format /menu button label with:
     - 1, 2, 3... sequential nomenclature
-    - Distinct adult emoji per row (never the same emoji for all)
-    - Channel Name (with Left-to-Right mark so RTL names don't flip button layout)
-    - Photo / Video counts from the channel screenshot image
-    - Price tag
+    - Exactly 1 distinct adult emoji per row
+    - Price first, then Channel Name, then Videos count (no photos/images count)
     """
     raw_name = (row_get(c, "name") or "").strip()
-    # Strip leading crown if present and clean generic 'VIP Channel #36' / 'Channel 68' fallback
-    raw_name = re.sub(r"^👑\s*", "", raw_name).strip()
-    if not raw_name or re.match(r"^(?:VIP\s*)?Channel\s*#?\d+$", raw_name, re.IGNORECASE):
+    clean_name = _STRIP_TITLE_EMOJIS_RE.sub("", raw_name)
+    clean_name = re.sub(r"\s+", " ", clean_name).strip(" •-—:|")
+    if not clean_name or re.match(r"^(?:VIP\s*)?Channel\s*#?\d+$", clean_name, re.IGNORECASE):
         clean_name = "VIP Exclusive"
-    else:
-        clean_name = raw_name
 
     lead_emoji = _ADULT_MENU_EMOJIS[(max(1, index) - 1) % len(_ADULT_MENU_EMOJIS)]
-    trail_emoji = _ADULT_TRAIL_EMOJIS[(max(1, index) - 1) % len(_ADULT_TRAIL_EMOJIS)]
-
-    media_badge = _format_media_badge(row_get(c, "media_counts") or "")
     price_val = float(row_get(c, "price_inr", 0) or 0)
-    price_tag = "FREE 🎁" if price_val <= 0 else f"₹{price_val:.0f} {trail_emoji}"
+    price_tag = "FREE" if price_val <= 0 else f"₹{price_val:.0f}"
 
-    if media_badge and media_badge.lower() not in clean_name.lower():
-        core_label = f"{index}. {lead_emoji} {clean_name}\u200e ({media_badge}) • {price_tag}"
-    else:
-        core_label = f"{index}. {lead_emoji} {clean_name}\u200e • {price_tag}"
+    videos_badge = _format_media_badge(row_get(c, "media_counts") or "")
+    # Isolate channel name direction with LRM + FSI/PDI (\u200e\u2066...\u2069\u200e) so Arabic/RTL names never flip the row
+    safe_name = f"\u2066{clean_name}\u2069\u200e"
 
-    # Pad shorter labels on the right with Braille blanks (\u2800) so Telegram buttons
-    # align from the side instead of floating in the middle of the button bar
-    target_width = 38
-    vis_len = len(core_label.replace("\u200e", ""))
-    if vis_len < target_width:
-        core_label = core_label + ("\u2800" * (target_width - vis_len))
-    return core_label
+    if videos_badge:
+        return f"\u200e{index}. {lead_emoji} {price_tag} • {safe_name} • {videos_badge}"
+    return f"\u200e{index}. {lead_emoji} {price_tag} • {safe_name}"
 
 
 def channel_list_keyboard(
