@@ -34,11 +34,14 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
+import sys
 import time
 from datetime import datetime
 from typing import Optional
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 import httpx
 import razorpay
@@ -255,22 +258,84 @@ def rzp_client() -> razorpay.Client:
     return pay.get_razorpay_client(RZP_KEY_ID, RZP_KEY_SECRET)
 
 
-def format_channel_menu_label(c) -> str:
-    """Format /menu button label with Channel Name, Photo/Video counts from image, and price."""
-    name = (row_get(c, "name") or f"VIP Channel #{c['id']}").strip()
-    media_counts = (row_get(c, "media_counts") or "").strip()
+_ADULT_MENU_EMOJIS = [
+    "🔞", "🍑", "🥵", "💦", "🍒", "💋", "👅", "🍆",
+    "🔥", "😈", "👙", "👠", "💃", "🌶️", "🫦", "❤️‍🔥",
+    "🍓", "🍌", "🥂", "🦊",
+]
+_ADULT_TRAIL_EMOJIS = [
+    "🔥", "💦", "💋", "🥵", "😈", "🍑", "🌶️", "🔞", "🍒", "🫦",
+]
+
+
+def _format_media_badge(media_counts: str) -> str:
+    """Format photo and video counts into a compact badge for /menu buttons."""
+    raw = (media_counts or "").strip()
+    if not raw:
+        return ""
+    m_p = re.search(r"(\d[\d,\s.]*[kKmM]?)\s*(?:photos?|p[hH]?[oO0][tT][oO0]s?|pics?)\b", raw, re.IGNORECASE)
+    m_v = re.search(r"(\d[\d,\s.]*[kKmM]?)\s*(?:videos?|v[iI1l!|]?[dD][eEcC0oO][oO0]?s?|vids?)\b", raw, re.IGNORECASE)
+    p_num = re.sub(r"[\s,]+", "", m_p.group(1)) if m_p else ""
+    v_num = re.sub(r"[\s,]+", "", m_v.group(1)) if m_v else ""
+    if p_num and v_num:
+        return f"📸 {p_num} • 🎬 {v_num} Videos"
+    if v_num:
+        return f"🎬 {v_num} Videos"
+    if p_num:
+        return f"📸 {p_num} Photos"
+    return raw
+
+
+def format_channel_menu_label(c, index: int = 1) -> str:
+    """
+    Format /menu button label with:
+    - 1, 2, 3... sequential nomenclature
+    - Distinct adult emoji per row (never the same emoji for all)
+    - Channel Name (with Left-to-Right mark so RTL names don't flip button layout)
+    - Photo / Video counts from the channel screenshot image
+    - Price tag
+    """
+    raw_name = (row_get(c, "name") or "").strip()
+    # Strip leading crown if present and clean generic 'VIP Channel #36' fallback
+    raw_name = re.sub(r"^👑\s*", "", raw_name).strip()
+    if not raw_name or re.match(r"^VIP Channel #\d+$", raw_name, re.IGNORECASE):
+        clean_name = f"VIP Exclusive"
+    else:
+        clean_name = raw_name
+
+    lead_emoji = _ADULT_MENU_EMOJIS[(max(1, index) - 1) % len(_ADULT_MENU_EMOJIS)]
+    trail_emoji = _ADULT_TRAIL_EMOJIS[(max(1, index) - 1) % len(_ADULT_TRAIL_EMOJIS)]
+
+    media_badge = _format_media_badge(row_get(c, "media_counts") or "")
     price_val = float(row_get(c, "price_inr", 0) or 0)
-    price_tag = "FREE 🎁" if price_val <= 0 else f"₹{price_val:.0f} ⚡"
-    if media_counts and media_counts.lower() not in name.lower():
-        return f"👑 {name} ({media_counts}) • {price_tag}"
-    return f"👑 {name} • {price_tag}"
+    price_tag = "FREE 🎁" if price_val <= 0 else f"₹{price_val:.0f} {trail_emoji}"
+
+    if media_badge and media_badge.lower() not in clean_name.lower():
+        return f"{index}. {lead_emoji} {clean_name}\u200e ({media_badge}) • {price_tag}"
+    return f"{index}. {lead_emoji} {clean_name}\u200e • {price_tag}"
 
 
-def channel_list_keyboard(channels: list, prefix: str = "buy") -> InlineKeyboardMarkup:
+def channel_list_keyboard(
+    channels: list, prefix: str = "buy", sort_by: str = "default"
+) -> InlineKeyboardMarkup:
+    sorted_channels = list(channels)
+    if sort_by == "price_asc":
+        sorted_channels.sort(key=lambda c: (float(row_get(c, "price_inr", 0) or 0), c["id"]))
+    elif sort_by == "price_desc":
+        sorted_channels.sort(key=lambda c: (-float(row_get(c, "price_inr", 0) or 0), c["id"]))
+
     buttons = []
-    for c in channels:
+    if prefix == "view" and len(sorted_channels) > 1:
+        asc_txt = "✅ 💰 Price: Low ➔ High" if sort_by == "price_asc" else "💰 Price: Low ➔ High"
+        desc_txt = "✅ 💎 Price: High ➔ Low" if sort_by == "price_desc" else "💎 Price: High ➔ Low"
+        buttons.append([
+            InlineKeyboardButton(asc_txt, callback_data="menu_sort:price_asc"),
+            InlineKeyboardButton(desc_txt, callback_data="menu_sort:price_desc"),
+        ])
+
+    for idx, c in enumerate(sorted_channels, 1):
         buttons.append([InlineKeyboardButton(
-            format_channel_menu_label(c),
+            format_channel_menu_label(c, index=idx),
             callback_data=f"{prefix}:{c['id']}"
         )])
     return InlineKeyboardMarkup(buttons)
@@ -1172,14 +1237,26 @@ def parse_channel_header_ocr_text(ocr_text: str) -> tuple[str, str]:
     inline_title_prefix = ""
 
     for idx, line in enumerate(clean_lines):
-        m_p = re.search(r"(\d[\d,\s]*[kKmM]?)\s*photos?\b", line, re.IGNORECASE)
-        m_v = re.search(r"(\d[\d,\s]*[kKmM]?)\s*videos?\b", line, re.IGNORECASE)
+        m_p = re.search(
+            r"(\d[\d,\s.]*[kKmM]?)\s*(?:photos?|p[hH]?[oO0][tT][oO0]s?|pics?)\b"
+            r"|\b(?:photos?|pics?)\s*[:\-]?\s*(\d[\d,\s.]*[kKmM]?)",
+            line,
+            re.IGNORECASE,
+        )
+        m_v = re.search(
+            r"(\d[\d,\s.]*[kKmM]?)\s*(?:videos?|v[iI1l!|]?[dD][eEcC0oO][oO0]?s?|vids?)\b"
+            r"|\b(?:videos?|vids?)\s*[:\-]?\s*(\d[\d,\s.]*[kKmM]?)",
+            line,
+            re.IGNORECASE,
+        )
         if m_p or m_v:
             media_line_idx = idx
             if m_p:
-                photos_str = re.sub(r"[\s,]+", "", m_p.group(1))
+                raw_p = m_p.group(1) or m_p.group(2) or ""
+                photos_str = re.sub(r"[\s,]+", "", raw_p)
             if m_v:
-                videos_str = re.sub(r"[\s,]+", "", m_v.group(1))
+                raw_v = m_v.group(1) or m_v.group(2) or ""
+                videos_str = re.sub(r"[\s,]+", "", raw_v)
             first_pos = min(
                 [m.start() for m in (m_p, m_v) if m is not None],
                 default=0,
@@ -1231,44 +1308,133 @@ def parse_channel_header_ocr_text(ocr_text: str) -> tuple[str, str]:
     return extracted_name[:80].strip(), media_counts
 
 
+_TESSERACT_CHECKED = False
+
+
+def _ensure_local_tesseract_sync() -> Optional[str]:
+    """Return path to local tesseract binary; auto-install on Ubuntu Linux if missing."""
+    global _TESSERACT_CHECKED
+    path = shutil.which("tesseract")
+    if path:
+        return path
+    for win_cand in (
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    ):
+        if os.path.isfile(win_cand):
+            return win_cand
+
+    if not _TESSERACT_CHECKED and sys.platform.startswith("linux"):
+        _TESSERACT_CHECKED = True
+        try:
+            subprocess.run(
+                ["sudo", "-n", "apt-get", "update", "-qq"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+            subprocess.run(
+                ["sudo", "-n", "apt-get", "install", "-y", "-qq", "tesseract-ocr"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=60,
+            )
+        except Exception:
+            pass
+        return shutil.which("tesseract")
+
+    _TESSERACT_CHECKED = True
+    return None
+
+
+def _run_local_tesseract_sync(raw_bytes: bytes) -> str:
+    """Run local tesseract CLI on enhanced dark/light image variants (offline, zero rate limits)."""
+    tess_bin = _ensure_local_tesseract_sync()
+    if not tess_bin:
+        return ""
+    try:
+        im = Image.open(io.BytesIO(raw_bytes)).convert("L")
+        w, h = im.size
+        if h > int(w * 0.85) and h > 320:
+            im = im.crop((0, 0, w, int(h * 0.42)))
+            w, h = im.size
+        # Upscale 2x so small grey subtitle digits ("730 videos") are crisp
+        im_up = im.resize((w * 2, h * 2), Image.LANCZOS)
+        # Invert dark-mode screenshot (white/grey text on dark background -> dark text on light background)
+        im_inv = ImageOps.autocontrast(ImageOps.invert(im_up))
+
+        collected: list[str] = []
+        for variant in (im_inv, ImageOps.autocontrast(im_up)):
+            buf = io.BytesIO()
+            variant.save(buf, format="PNG")
+            proc = subprocess.run(
+                [tess_bin, "stdin", "stdout", "--psm", "6"],
+                input=buf.getvalue(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+            txt = proc.stdout.decode("utf-8", errors="ignore").strip()
+            if txt:
+                collected.append(txt)
+                _, media = parse_channel_header_ocr_text(txt)
+                if media:
+                    break
+        return "\n".join(collected)
+    except Exception:
+        return ""
+
+
 async def _ocr_image_bytes(img_bytes: bytes) -> str:
-    """Send image bytes to OCR endpoint and return parsed text."""
+    """Extract text from image bytes using local Tesseract first, then OCR.space HTTP API fallback."""
+    local_text = await asyncio.to_thread(_run_local_tesseract_sync, img_bytes)
+    if local_text:
+        _, local_media = parse_channel_header_ocr_text(local_text)
+        if local_media:
+            return local_text
+
     b64 = "data:image/jpeg;base64," + base64.b64encode(img_bytes).decode("ascii")
     api_key = os.getenv("OCR_SPACE_API_KEY", "helloworld").strip() or "helloworld"
-    resp = await _ASYNC_HTTP_CLIENT.post(
-        "https://api.ocr.space/parse/image",
-        data={
-            "apikey": api_key,
-            "base64Image": b64,
-            "OCREngine": "2",
-        },
-        timeout=18.0,
-    )
-    if resp.status_code != 200:
-        return ""
-    data = resp.json()
-    results = data.get("ParsedResults") or []
-    if results and isinstance(results, list):
-        return str(results[0].get("ParsedText") or "")
-    return ""
+    for engine in ("2", "1"):
+        try:
+            resp = await _ASYNC_HTTP_CLIENT.post(
+                "https://api.ocr.space/parse/image",
+                data={
+                    "apikey": api_key,
+                    "base64Image": b64,
+                    "OCREngine": engine,
+                },
+                timeout=18.0,
+            )
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            if data.get("IsErroredOnProcessing"):
+                continue
+            results = data.get("ParsedResults") or []
+            if results and isinstance(results, list):
+                remote_txt = str(results[0].get("ParsedText") or "").strip()
+                if remote_txt:
+                    return f"{remote_txt}\n{local_text}".strip() if local_text else remote_txt
+        except Exception:
+            continue
+    return local_text
 
 
 def _prepare_image_crops_for_ocr(raw_bytes: bytes) -> list[bytes]:
     """
-    Prepare JPEG byte payloads for OCR:
-    - If image is a tall screenshot (h > w * 0.75 and h > 300), prepare top-40% header crop first,
-      followed by full resized image as fallback.
-    - Otherwise prepare the full image (resized if large).
+    Prepare a single optimal JPEG payload for OCR (avoiding duplicate API calls per image):
+    - If image is a tall phone screenshot (h > w * 0.85 and h > 320), crop the top 42% header/info region.
+    - Resize if larger than 1400px.
     """
     im = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     w, h = im.size
-    outputs: list[bytes] = []
 
-    if h > int(w * 0.75) and h > 300:
-        crop = im.crop((0, 0, w, int(h * 0.40)))
+    if h > int(w * 0.85) and h > 320:
+        crop = im.crop((0, 0, w, int(h * 0.42)))
         buf_crop = io.BytesIO()
         crop.save(buf_crop, format="JPEG", quality=90)
-        outputs.append(buf_crop.getvalue())
+        return [buf_crop.getvalue()]
 
     if max(w, h) > 1400:
         scale = 1400.0 / max(w, h)
@@ -1276,8 +1442,7 @@ def _prepare_image_crops_for_ocr(raw_bytes: bytes) -> list[bytes]:
 
     buf_full = io.BytesIO()
     im.save(buf_full, format="JPEG", quality=88)
-    outputs.append(buf_full.getvalue())
-    return outputs
+    return [buf_full.getvalue()]
 
 
 async def extract_channel_metadata_from_file_id(bot, photo_file_id: str) -> tuple[str, str]:
@@ -2595,9 +2760,11 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await reply_or_send_text(update, ctx, "😔 No channels available right now. Check back soon!")
         return
 
+    sort_by = ctx.user_data.get("menu_sort", "default") if ctx.user_data is not None else "default"
     text = (
-        "<blockquote><b>👑 EXCLUSIVE VIP CHANNELS DIRECTORY 👑</b></blockquote>\n"
+        "<blockquote><b>🔞 EXCLUSIVE VIP CHANNELS DIRECTORY 🔥</b></blockquote>\n"
         "<blockquote>✨ Select any VIP channel below to view full details, perks & unlock instant access:\n\n"
+        "💰 <i>Tap the sort buttons below to sort channels by price (Low ➔ High or High ➔ Low)</i>\n"
         "⚡ <i>Instant automated UPI payment • Protected 1-click delivery</i>\n"
         "──────────────────────────\n"
         f"🏆 Admin - {ADMIN_CONTACT}</blockquote>"
@@ -2605,7 +2772,7 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await reply_or_send_text(
         update, ctx,
         text,
-        reply_markup=channel_list_keyboard(channels, "view"),
+        reply_markup=channel_list_keyboard(channels, "view", sort_by=sort_by),
     )
 
 
@@ -2925,8 +3092,18 @@ async def cb_back_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return await send_mandatory_channels_prompt(query, ctx, unjoined, "menu")
 
     channels = get_active_channels_cached()
-    text = "🛍️ <b>Available Channels</b>\n\nTap a channel to get details:" if channels else "😔 No channels available right now."
-    markup = channel_list_keyboard(channels, "view") if channels else None
+    sort_by = ctx.user_data.get("menu_sort", "default") if ctx.user_data is not None else "default"
+    text = (
+        "<blockquote><b>🔞 EXCLUSIVE VIP CHANNELS DIRECTORY 🔥</b></blockquote>\n"
+        "<blockquote>✨ Select any VIP channel below to view full details, perks & unlock instant access:\n\n"
+        "💰 <i>Tap the sort buttons below to sort channels by price (Low ➔ High or High ➔ Low)</i>\n"
+        "⚡ <i>Instant automated UPI payment • Protected 1-click delivery</i>\n"
+        "──────────────────────────\n"
+        f"🏆 Admin - {ADMIN_CONTACT}</blockquote>"
+        if channels
+        else "😔 No channels available right now."
+    )
+    markup = channel_list_keyboard(channels, "view", sort_by=sort_by) if channels else None
 
     try:
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
@@ -2936,6 +3113,34 @@ async def cb_back_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             pass
         await reply_or_send_text(update, ctx, text, reply_markup=markup)
+
+
+async def cb_menu_sort(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle sorting the /menu channel list by price (Low -> High or High -> Low)."""
+    query = update.callback_query
+    sort_mode = query.data.split(":", 1)[1] if ":" in query.data else "default"
+    current_sort = ctx.user_data.get("menu_sort", "default") if ctx.user_data is not None else "default"
+    if sort_mode == current_sort:
+        sort_mode = "default"
+    if ctx.user_data is not None:
+        ctx.user_data["menu_sort"] = sort_mode
+
+    if sort_mode == "price_asc":
+        await query.answer("💰 Sorted by Price: Low ➔ High")
+    elif sort_mode == "price_desc":
+        await query.answer("💎 Sorted by Price: High ➔ Low")
+    else:
+        await query.answer("📋 Restored Default Order")
+
+    channels = get_active_channels_cached()
+    if not channels:
+        return
+
+    markup = channel_list_keyboard(channels, "view", sort_by=sort_mode)
+    try:
+        await query.edit_message_reply_markup(reply_markup=markup)
+    except Exception:
+        pass
 
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4765,14 +4970,18 @@ async def handle_chat_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYP
 
 async def backfill_channels_metadata_worker(bot) -> None:
     """
-    Background startup task: for any existing channels that still have a generic
-    'VIP Channel #N' name or missing photo/video counts, extract the real channel name
-    and photo/video counts from their saved post screenshot image (OCR) and channel link.
+    Background startup task: for active channels first (then inactive), extract the real
+    channel name and photo/video counts from their saved post screenshot image (OCR) and channel link.
     """
     try:
+        await asyncio.to_thread(db.recover_deleted_posts_from_sqlite_bytes, DB_PATH)
+        active_channels = await asyncio.to_thread(db.get_active_channels, DB_PATH)
         all_channels = await asyncio.to_thread(db.get_all_channels, DB_PATH)
+        active_ids = {c["id"] for c in active_channels}
+        ordered_channels = list(active_channels) + [c for c in all_channels if c["id"] not in active_ids]
+
         updated_any = False
-        for ch in all_channels:
+        for ch in ordered_channels:
             cid = ch["id"]
             cur_name = (row_get(ch, "name") or "").strip()
             cur_media = (row_get(ch, "media_counts") or "").strip()
@@ -4786,11 +4995,16 @@ async def backfill_channels_metadata_worker(bot) -> None:
             latest_post = await asyncio.to_thread(
                 db.get_latest_post_for_channel, DB_PATH, cid, link, cur_name
             )
+            if not (latest_post and latest_post["photo_file_id"]):
+                latest_post = await asyncio.to_thread(
+                    db.get_latest_post_for_channel, DB_PATH, cid, link, f"VIP Channel #{cid}"
+                )
+
             if latest_post and latest_post["photo_file_id"]:
                 fid = str(latest_post["photo_file_id"]).split("-100")[0].strip()
                 if fid.startswith("AgAC"):
                     ocr_name, ocr_media = await extract_channel_metadata_from_file_id(bot, fid)
-                    await asyncio.sleep(1.2)
+                    await asyncio.sleep(0.5)
 
             if not ocr_media and latest_post and latest_post["caption"]:
                 _, cap_media = parse_channel_header_ocr_text(latest_post["caption"])
@@ -4812,6 +5026,7 @@ async def backfill_channels_metadata_worker(bot) -> None:
 
             if updates:
                 await asyncio.to_thread(db.update_channel, DB_PATH, cid, **updates)
+                invalidate_channel_cache()
                 updated_any = True
                 logger.info("Backfilled channel #%d metadata: %s", cid, updates)
 
@@ -5221,6 +5436,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_del_fwd_post,  pattern=r"^del_fwd_post:"))
     app.add_handler(CallbackQueryHandler(cb_link_chatid,   pattern=r"^link_cid:"))
     app.add_handler(CallbackQueryHandler(cb_back_menu,     pattern=r"^back_menu$"))
+    app.add_handler(CallbackQueryHandler(cb_menu_sort,     pattern=r"^menu_sort:"))
     app.add_handler(CallbackQueryHandler(cb_guide_help,    pattern=r"^guide_help$"))
 
     logger.info("Bot is running…")

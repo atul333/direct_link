@@ -736,10 +736,16 @@ def get_latest_post_for_channel(
     channel_link: str = "",
     channel_name: str = "",
 ) -> Optional[sqlite3.Row]:
-    """Return the most recent post record for a channel (preferring one with photo_file_id)."""
+    """Return the most recent post record for a channel (preferring one with a full AgAC photo_file_id)."""
     posts = get_posts_for_channel(db_path, channel_id, channel_link, channel_name)
     if not posts:
         return None
+    with_photo = [
+        p for p in posts
+        if p["photo_file_id"] and str(p["photo_file_id"]).startswith("AgAC")
+    ]
+    if with_photo:
+        return sorted(with_photo, key=lambda r: r["id"], reverse=True)[0]
     with_media = [p for p in posts if p["photo_file_id"]]
     if with_media:
         return sorted(with_media, key=lambda r: r["id"], reverse=True)[0]
@@ -812,7 +818,7 @@ def recover_deleted_posts_from_sqlite_bytes(db_path: str) -> int:
     recovered = 0
 
     fallback_pat = re.compile(
-        rb"^(?P<caption>.{0,300}?)(?P<file_id>(?:AgAC|BAAC|CgAC|BQAC|DQAC)[A-Za-z0-9_-]{25,130}?)(?=[\x00-\x1f@-]|-100)",
+        rb"^(?P<caption>.{0,300}?)(?P<file_id>(?:AgAC|BAAC|CgAC|BQAC|DQAC)[A-Za-z0-9_-]{60,120}?)(?=-100\d{7,15}|@[A-Za-z0-9_]{4,35}|[\x00-\x1f])",
         re.DOTALL,
     )
 
@@ -822,34 +828,31 @@ def recover_deleted_posts_from_sqlite_bytes(db_path: str) -> int:
             "SELECT id, photo_file_id FROM posts WHERE channel_id = ? ORDER BY id DESC LIMIT 1",
             (cid,),
         ).fetchone()
-        if existing and existing["photo_file_id"]:
+        existing_fid = (existing["photo_file_id"] or "").strip() if existing else ""
+        if existing and len(existing_fid) >= 70 and "-100" not in existing_fid:
             continue
 
         title_str = (ch["name"] or "").strip()
-        if not title_str:
-            continue
-        title_b = title_str.encode("utf-8")
         if cid == 1:
             cid_b = b""
         elif 2 <= cid <= 127:
             cid_b = bytes([cid])
         else:
             cid_b = cid.to_bytes(2, "big", signed=True)
-        needle = cid_b + title_b
+
+        title_alts = [rb"VIP Channel #\d+"]
+        if title_str and not re.match(r"^VIP Channel #\d+$", title_str, re.IGNORECASE):
+            title_alts.insert(0, re.escape(title_str.encode("utf-8")))
+        needle_re = re.compile(
+            re.escape(cid_b) + rb"(?P<rec_title>" + b"|".join(title_alts) + rb")"
+        )
 
         best_match = None
-        search_pos = 0
-        while True:
-            idx = raw.find(needle, search_pos)
-            if idx == -1:
-                break
-            search_pos = idx + 1
-            # Ensure "VIP Channel #3" does not match prefix of "VIP Channel #39"
-            after_title_idx = idx + len(needle)
-            if after_title_idx < len(raw) and 48 <= raw[after_title_idx] <= 57:
-                # Wait: could a file_id or caption start with a digit?
-                # Telegram file_ids ALWAYS start with A, B, C, or D (AgAC, BAAC, CgAC, DQAC)!
-                pass
+        for m_needle in needle_re.finditer(raw):
+            idx = m_needle.start()
+            title_b = m_needle.group("rec_title")
+            needle_len = len(cid_b) + len(title_b)
+            after_title_idx = idx + needle_len
 
             # Strategy 1: Exact SQLite record header varint decoding
             parsed = None
@@ -861,9 +864,8 @@ def recover_deleted_posts_from_sqlite_bytes(db_path: str) -> int:
                         st, pos = _read_varint(raw, pos)
                         sts.append(st)
                     if sts[1] == len(title_b) * 2 + 13 and sts[7] == 51:
-                        body_pos = idx + len(needle)
+                        body_pos = idx + needle_len
                         vals = []
-                        # Check if Col 10 (cross_price_inr) is present in header
                         col_sts = sts[2:9] if (idx - pos) in (4, 6, 8) else sts[2:8]
                         for st in col_sts:
                             ln = _st_len(st)
