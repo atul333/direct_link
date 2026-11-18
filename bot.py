@@ -27,10 +27,12 @@ User commands:
 """
 
 import asyncio
+import html
 import io
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime
 from typing import Optional
@@ -218,7 +220,9 @@ async def track_user_action_fast(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     BC_MSG,                                             # broadcast
     VERIFY_ID,                                          # manual verify
     POST_PHOTO, POST_TEXT, POST_CHANNEL, POST_PRICE, POST_CROSS_PRICE, POST_TARGET, POST_PREVIEW, # channel broadcast wizard
-) = range(16)
+    CHECKLINKS_WAIT,                                    # interactive /checklinks link validator
+    NEWLINKS_WAIT,                                      # interactive /newlinks active-link comparator
+) = range(18)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -1122,9 +1126,8 @@ _LINK_ALIVE_CACHE: dict[int, float] = {}
 async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[bool, str]:
     """
     Check if a Telegram channel link is active and valid.
-    Returns (is_alive: bool, reason: str).
-    Guaranteed NEVER to falsely mark channels dead due to datacenter IP preview hiding,
-    rate limiting, network hiccups, or anti-bot checks.
+    Returns (is_alive: bool, detail_or_reason: str).
+    Never deletes any channel messages or deactivates database records.
     """
     # 1. If chat_id is available and bot is passed, verify via authoritative Telegram Bot API
     if bot and chat_id:
@@ -1134,25 +1137,29 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
             except (ValueError, TypeError):
                 target_chat_id = chat_id
             chat = await bot.get_chat(target_chat_id)
-            return True, f"Active (verified via Telegram API: {chat.title})"
+            return True, f"{chat.title or 'Active'}"
         except Exception as exc:
             err_msg = str(exc).lower()
             if "chat not found" in err_msg or "deactivated" in err_msg or "channel_banned" in err_msg:
                 return False, f"Telegram API confirmed: {exc}"
             # For admin/permissions errors, fall through to check the link
 
-    # 2. Normalize the link
+    # 2. Normalize the link (preserving exact case of invite hashes)
     clean_link = (link or "").strip()
     if not clean_link:
         return False, "Empty channel link"
 
-    if not clean_link.startswith("http"):
-        if clean_link.startswith("t.me"):
-            clean_link = f"https://{clean_link}"
+    if clean_link.startswith("@"):
+        clean_link = f"https://t.me/{clean_link.lstrip('@')}"
+    elif not clean_link.startswith(("http://", "https://")):
+        if clean_link.lower().startswith(("t.me/", "telegram.me/")):
+            clean_link = f"https://t.me/{clean_link.split('/', 1)[1]}"
         else:
             clean_link = f"https://t.me/{clean_link.lstrip('@')}"
+    else:
+        clean_link = re.sub(r"^https?://(?:www\.)?telegram\.me/", "https://t.me/", clean_link, flags=re.IGNORECASE)
 
-    is_invite = "/+" in clean_link or "joinchat" in clean_link
+    is_invite = "/+" in clean_link or "joinchat/" in clean_link.lower()
 
     # 3. For public username links (e.g. https://t.me/username), verify via Telegram Bot API first if bot is available
     if bot and not is_invite and "t.me/" in clean_link:
@@ -1160,193 +1167,92 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
         if slug and "/" not in slug and not slug.startswith("+"):
             try:
                 chat = await bot.get_chat(f"@{slug.lstrip('@')}")
-                return True, f"Active (verified via Telegram API: {chat.title or slug})"
+                return True, f"{chat.title or ('@' + slug)}"
             except Exception as exc:
                 err_msg = str(exc).lower()
                 if "deactivated" in err_msg or "channel_banned" in err_msg:
-                    return False, f"Telegram API confirmed banned: {exc}"
+                    return False, f"Channel banned/deactivated ({exc})"
 
     # 4. Check the web preview of the link on t.me
-    try:
-        resp = await _ASYNC_HTTP_CLIENT.get(clean_link)
-        # Transient rate limits or server errors MUST NEVER mark channel dead!
-        if resp.status_code in (429, 500, 502, 503, 504):
-            logger.warning("[LINK CHECK] Transient HTTP %d for %s — skipping check", resp.status_code, clean_link)
-            return True, f"Telegram rate limit/busy (HTTP {resp.status_code}) — treated as alive"
+    for attempt in range(2):
+        try:
+            resp = await _ASYNC_HTTP_CLIENT.get(clean_link)
+            if resp.status_code in (429, 500, 502, 503, 504):
+                if attempt == 0:
+                    await asyncio.sleep(1.5)
+                    continue
+                return False, f"Telegram rate limit / server busy (HTTP {resp.status_code})"
 
-        if resp.status_code == 404:
-            return False, "Link not found (HTTP 404)"
+            if resp.status_code == 404:
+                return False, "Link not found (HTTP 404)"
 
-        if resp.status_code != 200:
-            logger.warning("[LINK CHECK] Unexpected HTTP %d for %s — skipping check", resp.status_code, clean_link)
-            return True, f"HTTP status {resp.status_code} (skipped)"
+            if resp.status_code != 200:
+                return False, f"Unexpected HTTP status {resp.status_code}"
 
-        # If Telegram redirected an invalid username link away from t.me to telegram.org homepage
-        final_host = (resp.url.host or "").lower()
-        if final_host and "telegram.org" in final_host and "t.me" not in final_host:
-            return False, "Channel link redirected to telegram.org (invalid/deleted channel)"
+            # If Telegram redirected an invalid username link away from t.me to telegram.org homepage
+            final_host = (resp.url.host or "").lower()
+            if final_host and "telegram.org" in final_host and "t.me" not in final_host:
+                return False, "Invalid or deleted channel (redirected to telegram.org)"
 
-        text = resp.text
+            text = resp.text
 
-        # Anti-bot / Cloudflare / DDoS challenge protection:
-        if any(pat in text for pat in [
-            "Just a moment...",
-            "cf-chl-",
-            "challenge-running",
-            "Enable JavaScript and cookies to continue",
-            "Attention Required",
-        ]):
-            logger.warning("[LINK CHECK] Anti-bot challenge page detected for %s — skipping", clean_link)
-            return True, "Anti-bot challenge received — treated as alive"
+            # Genuine Telegram dead/banned/blocked indicators:
+            if (
+                "This channel can’t be displayed" in text
+                or "This channel can't be displayed" in text
+                or "because it was blocked" in text
+                or "violated Telegram" in text
+            ):
+                return False, "Channel is blocked/banned by Telegram"
 
-        # Verify it's actually Telegram web:
-        if "tgme_page" not in text and "tgme_head" not in text:
-            logger.warning("[LINK CHECK] Non-Telegram response format for %s — skipping", clean_link)
-            return True, "Non-standard page format — treated as alive"
+            if "Channel is inaccessible" in text:
+                return False, "Channel is inaccessible"
 
-        # Genuine Telegram dead/banned/blocked indicators:
-        if (
-            "This channel can’t be displayed" in text
-            or "This channel can't be displayed" in text
-            or "because it was blocked" in text
-            or "violated Telegram" in text
-        ):
-            return False, "Channel is blocked/banned by Telegram"
+            # Extract channel title and subscriber/member count from t.me preview
+            m_title = re.search(
+                r'class=["\']tgme_page_title["\'][^>]*>\s*(?:<span[^>]*>)?(.*?)(?:</span>)?\s*</div>',
+                text,
+                re.S,
+            )
+            title_str = html.unescape(re.sub(r"<[^>]+>", "", m_title.group(1)).strip()) if m_title else ""
 
-        if "Channel is inaccessible" in text:
-            return False, "Channel is inaccessible"
+            m_extra = re.search(r'class=["\']tgme_page_extra["\'][^>]*>(.*?)</div>', text, re.S)
+            extra_str = html.unescape(re.sub(r"<[^>]+>", "", m_extra.group(1)).strip()) if m_extra else ""
 
-        # For private invite links (t.me/+... or joinchat):
-        # NOTE: On cloud/datacenter IPs (AWS EC2, Cloudflare, etc.) and for join-request links,
-        # Telegram's t.me web server hides tgme_page_title and returns the generic
-        # "Join group chat on Telegram" (tgme_page_icon + tg://join?invite=...) page EVEN FOR LIVE CHANNELS!
-        # Therefore, NEVER mark an invite link dead on generic "Join group chat on Telegram" HTML.
-        if is_invite:
-            if "tg://join?invite=" in text or "tgme_action_button" in text or "tgme_page_action" in text:
-                return True, "Active (Invite link valid)"
-            if "tgme_page_title" in text or "tgme_page_extra" in text or "tgme_page_photo" in text:
+            if title_str or extra_str or "tgme_page_title" in text or "tgme_page_extra" in text:
+                if title_str and extra_str:
+                    return True, f"{title_str} ({extra_str})"
+                if title_str:
+                    return True, title_str
+                if extra_str:
+                    return True, f"Active ({extra_str})"
                 return True, "Active"
-            if "tgme_page" in text:
-                return True, "Active (Telegram invite page)"
-            return True, "Active"
-        else:
-            # Public channel/username
-            if "tgme_page_title" in text:
-                return True, "Active"
-            if "tgme_page_icon" in text and "tgme_page_extra" not in text and "tgme_action_button" not in text:
-                return False, "Channel username not found"
-            return True, "Active"
 
-    except Exception as exc:
-        logger.warning("[LINK CHECK] Network exception for %s: %s", clean_link, exc)
-        return True, f"Network check skipped ({exc})"
+            if is_invite:
+                return False, "Invite link is expired or invalid"
+            return False, "Channel username not found or invalid"
+
+        except Exception as exc:
+            if attempt == 0:
+                await asyncio.sleep(1.0)
+                continue
+            logger.warning("[LINK CHECK] Network exception for %s: %s", clean_link, exc)
+            return False, f"Connection error ({exc})"
+
+    return False, "Could not verify link"
 
 
 async def cleanup_dead_channel(bot, channel: dict, reason: str) -> int:
     """
-    Safely deactivate an expired/banned channel:
-    1. Delete promotional posts for this channel from main channel(s)
-    2. Soft-deactivate channel in database (is_active = 0) — NEVER purge user purchases or channel records!
-    3. Clear QR & channel caches
-    4. Notify admins with detailed breakdown
-    Returns count of successfully deleted promotional posts.
+    No-op: automatic channel post deletion and auto-deactivation have been disabled
+    so the bot never deletes any messages from the channel during link checks.
     """
-    channel_id = channel["id"]
-    channel_name = channel["name"]
-    channel_link = row_get(channel, "link", "")
-
-    _LINK_ALIVE_CACHE.pop(channel_id, None)
-
-    # 1. Find all promotional posts referencing this channel (by ID, shared link, link hash, or title)
-    posts = await asyncio.to_thread(
-        db.get_posts_for_channel, DB_PATH, channel_id, channel_link, channel_name
+    logger.info(
+        "Automatic channel post deletion is disabled; skipping cleanup for channel #%s (%s).",
+        channel.get("id"),
+        channel.get("name"),
     )
-    deleted_posts_count = 0
-    post_notes = []
-
-    default_main = await asyncio.to_thread(db.get_setting, DB_PATH, "main_channel_id") or MAIN_CHANNEL_ID
-
-    # 2. Delete posts from main channels immediately
-    for p in posts:
-        target = p["target_channel"] or default_main
-        msg_id = p["channel_msg_id"]
-        if target and msg_id:
-            try:
-                try:
-                    target_chat_id = int(target)
-                except (ValueError, TypeError):
-                    target_chat_id = target
-                await bot.delete_message(chat_id=target_chat_id, message_id=msg_id)
-                logger.info(
-                    "Deleted dead channel promotional post #%s (msg_id=%s) from %s",
-                    p["id"], msg_id, target
-                )
-                deleted_posts_count += 1
-                await asyncio.to_thread(db.clear_post_msg_id, DB_PATH, p["id"])
-            except Exception as exc:
-                err_str = str(exc)
-                if "message to delete not found" in err_str.lower():
-                    logger.info("Promotional post msg_id=%s was already deleted from %s", msg_id, target)
-                    deleted_posts_count += 1
-                    await asyncio.to_thread(db.clear_post_msg_id, DB_PATH, p["id"])
-                else:
-                    logger.warning(
-                        "Could not delete message %s from %s for post %d: %s",
-                        msg_id, target, p["id"], exc
-                    )
-                    post_notes.append(f"Msg #{msg_id} in {target}: {exc}")
-
-    # 3. Soft-deactivate channel in database (and any duplicate channel rows with same expired link)
-    await asyncio.to_thread(db.deactivate_channel, DB_PATH, channel_id, channel_link)
-    invalidate_channel_cache()
-    logger.info("Soft-deactivated dead channel #%d (%s) in database (user access preserved).", channel_id, channel_name)
-
-    # 4. Invalidate QR cache
-    dead_keys = [k for k in list(QR_CACHE.keys()) if k[1] == channel_id]
-    for k in dead_keys:
-        QR_CACHE.pop(k, None)
-
-    # 5. Build informative admin alert
-    if deleted_posts_count > 0:
-        cleanup_status = f"✅ Deleted <b>{deleted_posts_count}</b> post(s) from main channel (image & post data saved for 1-click reactivation)"
-    elif post_notes:
-        cleanup_status = f"⚠️ Could not delete message from channel:\n" + "\n".join(f"• {n}" for n in post_notes)
-    else:
-        cleanup_status = (
-            "ℹ️ <b>No promotional posts found in database for this channel.</b>\n"
-            "💡 <i>To delete an existing post from the channel manually:</i>\n"
-            "• Use <code>/delpost [message_id_or_link]</code>\n"
-            "• Or simply <b>forward the channel post to this bot</b> in private chat to delete it with one tap!"
-        )
-
-    alert_msg = (
-        f"🚨 <b>Channel Link Monitor Alert</b> 🚨\n\n"
-        f"The following channel link expired or the channel was banned:\n\n"
-        f"🏷️ <b>Channel:</b> {channel_name} (ID: #{channel_id})\n"
-        f"🔗 <b>Link:</b> <code>{channel_link}</code>\n"
-        f"⚠️ <b>Reason:</b> {reason}\n\n"
-        f"🧹 <b>Automatic Cleanup Executed:</b>\n"
-        f"{cleanup_status}\n"
-        f"✅ Channel deactivated (is_active=0)\n"
-        f"✅ Existing user purchases preserved in database\n"
-        f"✅ Access to post links blocked (users cannot purchase dead link)\n\n"
-        f"💡 <i>Tap the button below or use <code>/reactivate</code> / <code>/editchannel</code> to reactivate and re-send the post (with its image) to the Main Channel!</i>"
-    )
-    alert_kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🟢 Reactivate & Repost {channel_name} to Main Channel", callback_data=f"reactivate_ch:{channel_id}")]
-    ])
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                chat_id=admin_id,
-                text=alert_msg,
-                parse_mode=ParseMode.HTML,
-                reply_markup=alert_kb,
-            )
-        except Exception as exc:
-            logger.warning("Failed to notify admin %d of channel cleanup: %s", admin_id, exc)
-
-    return deleted_posts_count
+    return 0
 
 
 async def republish_channel_post(
@@ -1537,91 +1443,9 @@ async def republish_channel_post(
 
 
 async def channel_link_monitor_worker(bot) -> None:
-    """
-    Background worker periodically monitoring all active channels.
-
-    Safety rules:
-    1. CIRCUIT BREAKER: If ANY 2+ channels fail in the same cycle -> suspected network/rate-limit
-       outage. All fail counters are FULLY RESET to 0. No cleanup runs.
-    2. FAIL THRESHOLD: A single channel must fail FAIL_THRESHOLD consecutive cycles to be deactivated.
-    3. RECOVERY: A single successful check resets that channel's fail counter to 0.
-    4. CHAT_ID PRIORITY: If a channel has a chat_id set, uses authoritative Telegram Bot API
-       (never web scraping) — false positives are impossible via Bot API.
-    """
-    logger.info("Channel link monitor worker started.")
-    check_interval = int(os.getenv("CHANNEL_MONITOR_INTERVAL_SECONDS", "300"))
-    FAIL_THRESHOLD = int(os.getenv("CHANNEL_FAIL_THRESHOLD", "3"))
-
-    await asyncio.sleep(30)
-
-    while True:
-        try:
-            channels = await asyncio.to_thread(db.get_active_channels, DB_PATH)
-            if not channels:
-                await asyncio.sleep(check_interval)
-                continue
-
-            failed_this_cycle = []
-
-            for ch in channels:
-                cid = ch["id"]
-                link = ch["link"]
-                chat_id = row_get(ch, "chat_id")
-
-                # Stagger requests to avoid rate limits
-                await asyncio.sleep(3)
-
-                is_alive, reason = await check_channel_link_alive(link, bot=bot, chat_id=chat_id)
-                if not is_alive:
-                    failed_this_cycle.append((ch, reason))
-                    _channel_consecutive_failures[cid] = _channel_consecutive_failures.get(cid, 0) + 1
-                    logger.warning(
-                        "[LINK MONITOR] Channel #%d (%s) failed check (%d/%d): %s",
-                        cid, ch["name"], _channel_consecutive_failures[cid], FAIL_THRESHOLD, reason,
-                    )
-                else:
-                    _LINK_ALIVE_CACHE[cid] = time.time()
-                    if cid in _channel_consecutive_failures and _channel_consecutive_failures[cid] > 0:
-                        logger.info("[LINK MONITOR] Channel #%d (%s) recovered — resetting fail count.", cid, ch["name"])
-                    _channel_consecutive_failures[cid] = 0
-
-            # CIRCUIT BREAKER: If 2 or more channels failed in the SAME cycle, do not mass-deactivate!
-            if len(failed_this_cycle) >= 2:
-                logger.error(
-                    "[CIRCUIT BREAKER TRIGGERED] %d/%d channels failed in one cycle! "
-                    "Suspected Telegram rate-limit or network outage. "
-                    "FULLY RESETTING all fail counters — no cleanup will run.",
-                    len(failed_this_cycle), len(channels),
-                )
-                for ch, _ in failed_this_cycle:
-                    _channel_consecutive_failures[ch["id"]] = 0
-                await asyncio.sleep(check_interval)
-                continue
-
-            # Process single confirmed failures that reached threshold
-            for ch, reason in failed_this_cycle:
-                cid = ch["id"]
-                if _channel_consecutive_failures.get(cid, 0) >= FAIL_THRESHOLD:
-                    await asyncio.sleep(2)
-                    r1, reason2 = await check_channel_link_alive(ch["link"], bot=bot, chat_id=row_get(ch, "chat_id"))
-                    if r1:
-                        logger.info("[LINK MONITOR] Channel #%d passed final re-verification — aborting cleanup.", cid)
-                        _channel_consecutive_failures[cid] = 0
-                        continue
-
-                    logger.error(
-                        "[LINK MONITOR] Channel #%d (%s) confirmed dead after %d checks (%s). Initiating safe cleanup...",
-                        cid, ch["name"], FAIL_THRESHOLD, reason2,
-                    )
-                    await cleanup_dead_channel(bot, dict(ch), reason2)
-                    _channel_consecutive_failures.pop(cid, None)
-
-            await asyncio.sleep(check_interval)
-        except asyncio.CancelledError:
-            break
-        except Exception as exc:
-            logger.error("Error in channel_link_monitor_worker: %s", exc)
-            await asyncio.sleep(60)
+    """Background channel post deletion has been disabled per admin configuration."""
+    logger.info("Background channel post auto-deletion worker is disabled.")
+    return
 async def cmd_delpost(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Admin command: /delpost <message_id_or_link> to delete a specific post from the channel."""
     if not is_admin(update.effective_user.id):
@@ -1697,43 +1521,307 @@ async def cmd_delpost(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
-async def cmd_checklinks(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin command to manually trigger health check of all channel links."""
-    if not is_admin(update.effective_user.id):
-        return
+_TG_LINK_EXTRACT_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/(?:\+[A-Za-z0-9_-]+|joinchat/[A-Za-z0-9_-]+|[A-Za-z0-9_]{4,})(?:\?[A-Za-z0-9_=&-]+)?"
+    r"|(?<!\S)@[A-Za-z][A-Za-z0-9_]{3,}",
+    re.IGNORECASE,
+)
 
-    channels = get_active_channels_cached()
-    if not channels:
-        await update.message.reply_text("ℹ️ No active channels found in database.")
-        return
 
-    msg = await update.message.reply_text("🔍 <b>Checking all channel links...</b>\nPlease wait.", parse_mode=ParseMode.HTML)
+def _canonical_telegram_link_key(link: str) -> str:
+    """
+    Build a canonical comparison key for a Telegram channel link so invite links
+    (t.me/+HASH and t.me/joinchat/HASH) and public links (@user and t.me/user) match reliably.
+    """
+    raw = (link or "").strip().rstrip(".,;:!)>]}")
+    if not raw:
+        return ""
+    if raw.startswith("@"):
+        return f"user:{raw.lstrip('@').lower()}"
 
-    report_lines = []
-    cleaned_count = 0
+    cleaned = re.sub(
+        r"^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/",
+        "",
+        raw,
+        flags=re.IGNORECASE,
+    ).split("?", 1)[0].strip("/")
 
-    for ch in channels:
-        ch_chat_id = row_get(ch, "chat_id")
-        is_alive, reason = await check_channel_link_alive(ch["link"], bot=ctx.bot, chat_id=ch_chat_id)
-        if is_alive:
-            report_lines.append(f"✅ <b>{ch['name']}</b>: Active\n<code>{ch['link']}</code>")
+    if cleaned.startswith("+"):
+        return f"invite:{cleaned[1:]}"
+    if cleaned.lower().startswith("joinchat/"):
+        return f"invite:{cleaned.split('/', 1)[1].strip('/')}"
+    return f"user:{cleaned.lower()}"
+
+
+def extract_telegram_links(raw_text: str, entities=None) -> list[str]:
+    """Extract and normalize unique Telegram channel links from text and message entities."""
+    candidates: list[str] = []
+    if raw_text:
+        for match in _TG_LINK_EXTRACT_RE.finditer(raw_text):
+            candidates.append(match.group(0).strip().rstrip(".,;:!)>]}"))
+
+    if entities:
+        for ent in entities:
+            ent_url = getattr(ent, "url", None)
+            if ent_url:
+                for match in _TG_LINK_EXTRACT_RE.finditer(ent_url):
+                    candidates.append(match.group(0).strip().rstrip(".,;:!)>]}"))
+
+    normalized_links: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        if not item:
+            continue
+        if item.startswith("@"):
+            slug = item.lstrip("@")
+            if slug.lower() in (
+                "checklinks", "monitor", "newlinks", "comparelinks",
+                "unadded", "missinglinks", "restlinks", "cancel",
+            ):
+                continue
+            norm = f"https://t.me/{slug}"
+        elif item.lower().startswith(("http://", "https://")):
+            norm = re.sub(
+                r"^https?://(?:www\.)?(?:t\.me|telegram\.me)/",
+                "https://t.me/",
+                item,
+                flags=re.IGNORECASE,
+            )
         else:
-            # Re-verify
-            r1, _ = await check_channel_link_alive(ch["link"], bot=ctx.bot, chat_id=ch_chat_id)
-            if not r1:
-                deleted_posts = await cleanup_dead_channel(ctx.bot, dict(ch), reason)
-                cleaned_count += 1
-                report_lines.append(
-                    f"❌ <b>{ch['name']}</b>: Expired/Banned\n"
-                    f"🧹 Cleaned up {deleted_posts} post(s) & purged from DB"
-                )
+            path_part = item.split("/", 1)[1] if "/" in item else item
+            norm = f"https://t.me/{path_part}"
 
-    summary_text = (
-        f"📊 <b>Channel Link Health Check Report</b>\n\n"
-        + "\n\n".join(report_lines)
-        + f"\n\n🏁 <b>Summary:</b> {len(channels) - cleaned_count} active, {cleaned_count} removed."
+        canon_key = _canonical_telegram_link_key(norm) or norm
+        if canon_key not in seen:
+            seen.add(canon_key)
+            normalized_links.append(norm)
+
+    return normalized_links
+
+
+async def _run_checklinks_validation(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, links: list[str]
+) -> int:
+    """Validate provided Telegram channel links and return working links without deleting any channel messages."""
+    msg = await update.effective_message.reply_text(
+        f"🔍 <b>Validating {len(links)} channel link(s)...</b>\nPlease wait.",
+        parse_mode=ParseMode.HTML,
     )
-    await msg.edit_text(summary_text, parse_mode=ParseMode.HTML)
+
+    working_links: list[tuple[str, str]] = []
+    dead_links: list[tuple[str, str]] = []
+
+    for idx, link in enumerate(links):
+        if idx > 0:
+            await asyncio.sleep(0.35)
+        is_alive, detail = await check_channel_link_alive(link, bot=ctx.bot)
+        if is_alive:
+            working_links.append((link, detail))
+        else:
+            dead_links.append((link, detail))
+
+    lines: list[str] = [
+        "📊 <b>Channel Links Validation Report</b>",
+        f"Total Checked: <b>{len(links)}</b> • ✅ Working: <b>{len(working_links)}</b> • ❌ Not Working: <b>{len(dead_links)}</b>\n",
+    ]
+
+    if working_links:
+        lines.append(f"✅ <b>Working Links ({len(working_links)}):</b>")
+        for i, (w_link, w_detail) in enumerate(working_links, 1):
+            safe_detail = html.escape(w_detail) if w_detail else "Active"
+            lines.append(f"{i}. <code>{html.escape(w_link)}</code> — <b>{safe_detail}</b>")
+
+        only_urls = "\n".join(html.escape(w_link) for w_link, _ in working_links)
+        lines.append(f"\n📋 <b>Working Links Only (Tap to Copy):</b>\n<pre>{only_urls}</pre>")
+    else:
+        lines.append("⚠️ <b>No working links found among the provided links.</b>")
+
+    if dead_links:
+        lines.append(f"\n❌ <b>Expired / Not Working Links ({len(dead_links)}):</b>")
+        for i, (d_link, d_reason) in enumerate(dead_links, 1):
+            lines.append(f"{i}. <code>{html.escape(d_link)}</code> — <i>{html.escape(d_reason)}</i>")
+
+    full_text = "\n".join(lines)
+    if len(full_text) <= 4096:
+        await msg.edit_text(full_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    else:
+        await msg.edit_text(
+            full_text[:4000] + "\n\n<i>(Continued below...)</i>",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        remaining = full_text[4000:]
+        while remaining:
+            chunk = remaining[:4000]
+            remaining = remaining[4000:]
+            await update.effective_message.reply_text(
+                chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+            )
+
+    return ConversationHandler.END
+
+
+async def cmd_checklinks(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Admin command: prompt admin to send channel links, then validate and return working links."""
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return ConversationHandler.END
+
+    raw_text = (update.effective_message.text or "") if update.effective_message else ""
+    body_after_cmd = re.sub(r"^/(?:checklinks|monitor)(?:@\S+)?\s*", "", raw_text, count=1, flags=re.IGNORECASE)
+    entities = update.effective_message.entities if update.effective_message else None
+    provided_links = extract_telegram_links(body_after_cmd, entities=entities)
+
+    if provided_links:
+        return await _run_checklinks_validation(update, ctx, provided_links)
+
+    await update.effective_message.reply_text(
+        "🔍 <b>Check Channel Links</b>\n\n"
+        "Please send the channel link(s) you want to validate (one per line, or separated by spaces).\n\n"
+        "✅ I will check all provided links and return the <b>working links</b>.\n"
+        "🛡️ <i>No messages or posts will be deleted from any channel.</i>\n\n"
+        "Type /cancel anytime to abort.",
+        parse_mode=ParseMode.HTML,
+    )
+    return CHECKLINKS_WAIT
+
+
+async def checklinks_receive_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive channel links sent by admin after /checklinks and validate them."""
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return ConversationHandler.END
+
+    msg = update.effective_message
+    raw_text = (msg.text or msg.caption or "") if msg else ""
+    entities = (msg.entities or msg.caption_entities) if msg else None
+    links = extract_telegram_links(raw_text, entities=entities)
+
+    if not links:
+        await msg.reply_text(
+            "⚠️ <b>No valid Telegram channel links found in your message.</b>\n\n"
+            "Please send one or more channel links (e.g. <code>https://t.me/+xxxx</code> or <code>https://t.me/channelname</code>), or type /cancel to abort.",
+            parse_mode=ParseMode.HTML,
+        )
+        return CHECKLINKS_WAIT
+
+    return await _run_checklinks_validation(update, ctx, links)
+
+
+async def _run_newlinks_comparison(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, links: list[str]
+) -> int:
+    """Compare provided links with active channels in DB and return the links not added in bot yet."""
+    active_channels = await asyncio.to_thread(db.get_active_channels, DB_PATH)
+
+    active_by_key: dict[str, dict] = {}
+    for ch in active_channels:
+        ch_link = (row_get(ch, "link") or "").strip()
+        key = _canonical_telegram_link_key(ch_link)
+        if key:
+            active_by_key[key] = dict(ch)
+
+    not_added_links: list[str] = []
+    already_added_links: list[tuple[str, dict]] = []
+
+    for link in links:
+        key = _canonical_telegram_link_key(link)
+        matched_ch = active_by_key.get(key) if key else None
+        if matched_ch:
+            already_added_links.append((link, matched_ch))
+        else:
+            not_added_links.append(link)
+
+    lines: list[str] = [
+        "🆕 <b>Unadded Channel Links Report</b>",
+        (
+            f"Provided: <b>{len(links)}</b> • "
+            f"🆕 Not Added Yet: <b>{len(not_added_links)}</b> • "
+            f"✅ Already Active in Bot: <b>{len(already_added_links)}</b>\n"
+        ),
+    ]
+
+    if not_added_links:
+        lines.append(f"🆕 <b>Links NOT Added in Bot Yet ({len(not_added_links)}):</b>")
+        for i, n_link in enumerate(not_added_links, 1):
+            lines.append(f"{i}. <code>{html.escape(n_link)}</code>")
+
+        copy_block = "\n".join(html.escape(n_link) for n_link in not_added_links)
+        lines.append(f"\n📋 <b>Not Added Links Only (Tap to Copy):</b>\n<pre>{copy_block}</pre>")
+    else:
+        lines.append("✅ <b>All provided links are already active in the bot!</b>")
+
+    if already_added_links:
+        lines.append(f"\n✅ <b>Already Active in Bot ({len(already_added_links)}):</b>")
+        for i, (a_link, ch_info) in enumerate(already_added_links, 1):
+            ch_name = html.escape(str(ch_info.get("name") or f"Channel #{ch_info.get('id')}"))
+            ch_id = ch_info.get("id")
+            lines.append(f"{i}. <code>{html.escape(a_link)}</code> — <b>{ch_name}</b> (ID #{ch_id})")
+
+    full_text = "\n".join(lines)
+    msg = update.effective_message
+    if len(full_text) <= 4096:
+        await msg.reply_text(full_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    else:
+        remaining = full_text
+        while remaining:
+            chunk = remaining[:4000]
+            remaining = remaining[4000:]
+            await msg.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+    return ConversationHandler.END
+
+
+async def cmd_newlinks(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Admin command: ask admin to send channel links, compare with active bot links, and return unadded links."""
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return ConversationHandler.END
+
+    raw_text = (update.effective_message.text or "") if update.effective_message else ""
+    body_after_cmd = re.sub(
+        r"^/(?:newlinks|comparelinks|unadded|missinglinks|restlinks)(?:@\S+)?\s*",
+        "",
+        raw_text,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    entities = update.effective_message.entities if update.effective_message else None
+    provided_links = extract_telegram_links(body_after_cmd, entities=entities)
+
+    if provided_links:
+        return await _run_newlinks_comparison(update, ctx, provided_links)
+
+    await update.effective_message.reply_text(
+        "🆕 <b>Find Unadded Channel Links</b>\n\n"
+        "Please send your list of channel links (one per line, or separated by spaces).\n\n"
+        "🔍 I will compare them with all <b>active links in the bot</b> and send you the remaining links that are <b>not added in the bot yet</b>.\n\n"
+        "Type /cancel anytime to abort.",
+        parse_mode=ParseMode.HTML,
+    )
+    return NEWLINKS_WAIT
+
+
+async def newlinks_receive_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive channel links sent by admin after /newlinks and return those not active in the bot yet."""
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return ConversationHandler.END
+
+    msg = update.effective_message
+    raw_text = (msg.text or msg.caption or "") if msg else ""
+    entities = (msg.entities or msg.caption_entities) if msg else None
+    links = extract_telegram_links(raw_text, entities=entities)
+
+    if not links:
+        await msg.reply_text(
+            "⚠️ <b>No valid Telegram channel links found in your message.</b>\n\n"
+            "Please send one or more channel links (e.g. <code>https://t.me/+xxxx</code> or <code>https://t.me/channelname</code>), or type /cancel to abort.",
+            parse_mode=ParseMode.HTML,
+        )
+        return NEWLINKS_WAIT
+
+    return await _run_newlinks_comparison(update, ctx, links)
 
 
 async def cmd_setchatid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2384,7 +2472,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "• /editchannel — Edit channel details/price/link\n"
             "• /delchannel — Deactivate a channel\n"
             "• /channels — List all channels\n"
-            "• /checklinks — Live scan all links & purge dead/banned channels\n"
+            "• /checklinks — Validate channel links & get working links\n"
+            "• /newlinks — Compare links with active channels & get unadded links\n"
             "• /stats — Full sales & revenue dashboard\n"
             "• /users — View recent registered users\n"
             "• /payments — View channel payments\n"
@@ -4473,11 +4562,7 @@ async def post_init(app: Application) -> None:
     poller_task = asyncio.create_task(poll_pending_payments(app.bot))
     app.bot_data["poller_task"] = poller_task
 
-    # 4. Start background channel link monitor worker
-    monitor_task = asyncio.create_task(channel_link_monitor_worker(app.bot))
-    app.bot_data["monitor_task"] = monitor_task
-
-    # 3. Set bot commands
+    # 4. Set bot commands
     user_cmds = [
         BotCommand("start", "Start the bot"),
         BotCommand("menu", "Browse available channels"),
@@ -4504,7 +4589,8 @@ async def post_init(app: Application) -> None:
         BotCommand("payments", "List payments for a channel"),
         BotCommand("check", "Check payment status by ID"),
         BotCommand("mandatory", "View status of mandatory channels"),
-        BotCommand("checklinks", "Scan channels & purge dead links"),
+        BotCommand("checklinks", "Validate channel links & get working links"),
+        BotCommand("newlinks", "Compare links & get links not added in bot yet"),
         BotCommand("ban", "Ban a user"),
         BotCommand("unban", "Unban a user"),
     ]
@@ -4715,12 +4801,51 @@ def main() -> None:
         per_message=False,
     )
 
+    # ── Check Links conversation ─────────────────────────────────────────────
+    checklinks_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler(["checklinks", "monitor"], cmd_checklinks),
+        ],
+        states={
+            CHECKLINKS_WAIT: [
+                MessageHandler(
+                    (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
+                    checklinks_receive_links,
+                ),
+            ],
+        },
+        fallbacks=[cancel_handler],
+        allow_reentry=True,
+    )
+
+    # ── New / Unadded Links comparison conversation ──────────────────────────
+    newlinks_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler(
+                ["newlinks", "comparelinks", "unadded", "missinglinks", "restlinks"],
+                cmd_newlinks,
+            ),
+        ],
+        states={
+            NEWLINKS_WAIT: [
+                MessageHandler(
+                    (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
+                    newlinks_receive_links,
+                ),
+            ],
+        },
+        fallbacks=[cancel_handler],
+        allow_reentry=True,
+    )
+
     # ── Register all handlers ────────────────────────────────────────────────
     app.add_handler(post_conv)
     app.add_handler(add_channel_conv)
     app.add_handler(edit_channel_conv)
     app.add_handler(broadcast_conv)
     app.add_handler(verify_conv)
+    app.add_handler(checklinks_conv)
+    app.add_handler(newlinks_conv)
 
     # Zero-load action tracker: records username in DB for ANY user interaction (group=-10 runs first)
     app.add_handler(TypeHandler(Update, track_user_action_fast), group=-10)
@@ -4752,7 +4877,6 @@ def main() -> None:
     app.add_handler(CommandHandler("users",          cmd_users))
     app.add_handler(CommandHandler("payments",       cmd_payments))
     app.add_handler(CommandHandler(["check", "checkpayment", "payment"], cmd_check_payment))
-    app.add_handler(CommandHandler(["checklinks", "monitor"], cmd_checklinks))
     app.add_handler(CommandHandler("ban",            cmd_ban))
     app.add_handler(CommandHandler("unban",          cmd_unban))
 
