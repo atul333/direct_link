@@ -306,10 +306,10 @@ def format_channel_menu_label(c, index: int = 1) -> str:
     - Price tag
     """
     raw_name = (row_get(c, "name") or "").strip()
-    # Strip leading crown if present and clean generic 'VIP Channel #36' fallback
+    # Strip leading crown if present and clean generic 'VIP Channel #36' / 'Channel 68' fallback
     raw_name = re.sub(r"^👑\s*", "", raw_name).strip()
-    if not raw_name or re.match(r"^VIP Channel #\d+$", raw_name, re.IGNORECASE):
-        clean_name = f"VIP Exclusive"
+    if not raw_name or re.match(r"^(?:VIP\s*)?Channel\s*#?\d+$", raw_name, re.IGNORECASE):
+        clean_name = "VIP Exclusive"
     else:
         clean_name = raw_name
 
@@ -321,8 +321,17 @@ def format_channel_menu_label(c, index: int = 1) -> str:
     price_tag = "FREE 🎁" if price_val <= 0 else f"₹{price_val:.0f} {trail_emoji}"
 
     if media_badge and media_badge.lower() not in clean_name.lower():
-        return f"{index}. {lead_emoji} {clean_name}\u200e ({media_badge}) • {price_tag}"
-    return f"{index}. {lead_emoji} {clean_name}\u200e • {price_tag}"
+        core_label = f"{index}. {lead_emoji} {clean_name}\u200e ({media_badge}) • {price_tag}"
+    else:
+        core_label = f"{index}. {lead_emoji} {clean_name}\u200e • {price_tag}"
+
+    # Pad shorter labels on the right with Braille blanks (\u2800) so Telegram buttons
+    # align from the side instead of floating in the middle of the button bar
+    target_width = 38
+    vis_len = len(core_label.replace("\u200e", ""))
+    if vis_len < target_width:
+        core_label = core_label + ("\u2800" * (target_width - vis_len))
+    return core_label
 
 
 def channel_list_keyboard(
@@ -1358,18 +1367,20 @@ def _ensure_local_tesseract_sync() -> Optional[str]:
 
 
 def _run_local_tesseract_sync(raw_bytes: bytes) -> str:
-    """Run local tesseract CLI on enhanced dark/light image variants (offline, zero rate limits)."""
+    """Run local tesseract CLI on enhanced dark/light full image variants (offline, zero rate limits)."""
     tess_bin = _ensure_local_tesseract_sync()
     if not tess_bin:
         return ""
     try:
         im = Image.open(io.BytesIO(raw_bytes)).convert("L")
         w, h = im.size
-        if h > int(w * 0.85) and h > 320:
-            im = im.crop((0, 0, w, int(h * 0.42)))
-            w, h = im.size
-        # Upscale 2x so small grey subtitle digits ("730 videos") are crisp
-        im_up = im.resize((w * 2, h * 2), Image.LANCZOS)
+        if max(w, h) > 1200:
+            scale = 1200.0 / max(w, h)
+            im_up = im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+        elif max(w, h) < 700:
+            im_up = im.resize((w * 2, h * 2), Image.LANCZOS)
+        else:
+            im_up = im
         # Invert dark-mode screenshot (white/grey text on dark background -> dark text on light background)
         im_inv = ImageOps.autocontrast(ImageOps.invert(im_up))
 
@@ -1382,7 +1393,7 @@ def _run_local_tesseract_sync(raw_bytes: bytes) -> str:
                 input=buf.getvalue(),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                timeout=10,
+                timeout=12,
             )
             txt = proc.stdout.decode("utf-8", errors="ignore").strip()
             if txt:
@@ -1433,18 +1444,11 @@ async def _ocr_image_bytes(img_bytes: bytes) -> str:
 
 def _prepare_image_crops_for_ocr(raw_bytes: bytes) -> list[bytes]:
     """
-    Prepare a single optimal JPEG payload for OCR (avoiding duplicate API calls per image):
-    - If image is a tall phone screenshot (h > w * 0.85 and h > 320), crop the top 42% header/info region.
-    - Resize if larger than 1400px.
+    Prepare full image JPEG payload for OCR (keeping the entire screenshot so photo/video
+    counts in the middle of Channel Info screens are never cropped out).
     """
     im = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     w, h = im.size
-
-    if h > int(w * 0.85) and h > 320:
-        crop = im.crop((0, 0, w, int(h * 0.42)))
-        buf_crop = io.BytesIO()
-        crop.save(buf_crop, format="JPEG", quality=90)
-        return [buf_crop.getvalue()]
 
     if max(w, h) > 1400:
         scale = 1400.0 / max(w, h)
