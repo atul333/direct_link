@@ -116,23 +116,25 @@ def init_db(db_path: str) -> None:
     # ── Channels ──────────────────────────────────────────────────────────────
     cur.execute("""
         CREATE TABLE IF NOT EXISTS channels (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            name        TEXT NOT NULL,
-            link        TEXT NOT NULL,
-            price_inr   REAL NOT NULL,
-            description TEXT,
-            is_active   INTEGER NOT NULL DEFAULT 1,
-            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-            created_by  INTEGER NOT NULL,
-            chat_id     TEXT
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            name         TEXT NOT NULL,
+            link         TEXT NOT NULL,
+            price_inr    REAL NOT NULL,
+            description  TEXT,
+            is_active    INTEGER NOT NULL DEFAULT 1,
+            created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+            created_by   INTEGER NOT NULL,
+            chat_id      TEXT,
+            media_counts TEXT
         )
     """)
 
-    # Migrate existing channels table if chat_id column is missing
-    try:
-        cur.execute("ALTER TABLE channels ADD COLUMN chat_id TEXT")
-    except sqlite3.OperationalError:
-        pass
+    # Migrate existing channels table if chat_id or media_counts column is missing
+    for ch_col in ("chat_id TEXT", "media_counts TEXT"):
+        try:
+            cur.execute(f"ALTER TABLE channels ADD COLUMN {ch_col}")
+        except sqlite3.OperationalError:
+            pass
 
     # ── Payments ──────────────────────────────────────────────────────────────
     cur.execute("""
@@ -341,20 +343,21 @@ def get_user(db_path: str, user_id: int) -> Optional[sqlite3.Row]:
 
 def add_channel(db_path: str, name: str, link: str,
                 price_inr: float, description: str, admin_id: int,
-                chat_id: Optional[str] = None) -> int:
+                chat_id: Optional[str] = None,
+                media_counts: Optional[str] = None) -> int:
     conn = get_connection(db_path)
     with _WRITE_LOCK:
         cur = conn.execute("""
-            INSERT INTO channels (name, link, price_inr, description, created_by, chat_id)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (name, link, price_inr, description, admin_id, chat_id))
+            INSERT INTO channels (name, link, price_inr, description, created_by, chat_id, media_counts)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (name, link, price_inr, description, admin_id, chat_id, media_counts))
         channel_id = cur.lastrowid
         conn.commit()
     return channel_id
 
 
 def update_channel(db_path: str, channel_id: int, **kwargs) -> bool:
-    allowed = {"name", "link", "price_inr", "description", "is_active", "chat_id"}
+    allowed = {"name", "link", "price_inr", "description", "is_active", "chat_id", "media_counts"}
     updates = {k: v for k, v in kwargs.items() if k in allowed}
     if not updates:
         return False

@@ -27,6 +27,7 @@ User commands:
 """
 
 import asyncio
+import base64
 import html
 import io
 import json
@@ -36,6 +37,8 @@ import re
 import time
 from datetime import datetime
 from typing import Optional
+
+from PIL import Image
 
 import httpx
 import razorpay
@@ -252,12 +255,22 @@ def rzp_client() -> razorpay.Client:
     return pay.get_razorpay_client(RZP_KEY_ID, RZP_KEY_SECRET)
 
 
+def format_channel_menu_label(c) -> str:
+    """Format /menu button label with Channel Name, Photo/Video counts from image, and price."""
+    name = (row_get(c, "name") or f"VIP Channel #{c['id']}").strip()
+    media_counts = (row_get(c, "media_counts") or "").strip()
+    price_val = float(row_get(c, "price_inr", 0) or 0)
+    price_tag = "FREE 🎁" if price_val <= 0 else f"₹{price_val:.0f} ⚡"
+    if media_counts and media_counts.lower() not in name.lower():
+        return f"👑 {name} ({media_counts}) • {price_tag}"
+    return f"👑 {name} • {price_tag}"
+
+
 def channel_list_keyboard(channels: list, prefix: str = "buy") -> InlineKeyboardMarkup:
     buttons = []
     for c in channels:
-        price_tag = "FREE 🎁" if c["price_inr"] <= 0 else f"₹{c['price_inr']:.0f} ⚡"
         buttons.append([InlineKeyboardButton(
-            f"👑 {c['name']} • {price_tag}",
+            format_channel_menu_label(c),
             callback_data=f"{prefix}:{c['id']}"
         )])
     return InlineKeyboardMarkup(buttons)
@@ -1121,6 +1134,207 @@ async def poll_pending_payments(bot) -> None:
 _channel_consecutive_failures: dict[int, int] = {}
 # Positive cache of recently verified working channel links: {channel_id: verified_at_ts}
 _LINK_ALIVE_CACHE: dict[int, float] = {}
+
+
+# In-memory cache of OCR results per Telegram photo file_id: {file_id: (channel_name, media_counts)}
+_IMAGE_OCR_CACHE: dict[str, tuple[str, str]] = {}
+_OCR_NOISE_WORDS = {
+    "media", "links", "files", "voice", "gifs", "music", "members",
+    "subscribers", "rec", "4g", "5g", "lte", "volte", "wifi",
+}
+
+
+def parse_channel_header_ocr_text(ocr_text: str) -> tuple[str, str]:
+    """
+    Parse OCR text from a Telegram channel screenshot header.
+    Returns (channel_name, media_counts_str) e.g. ('福利精选中心', '11642 photos, 28905 videos')
+    or ('White couple', '730 videos').
+    """
+    if not ocr_text:
+        return "", ""
+
+    clean_lines: list[str] = []
+    for raw_line in ocr_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("[Note:") or "ocr.space" in line.lower():
+            continue
+        # Strip leading back-arrow symbols from mobile header
+        line = re.sub(r"^[←⬅<«\-—•*+~|\\/:\s]+", "", line).strip()
+        if not line:
+            continue
+        clean_lines.append(line)
+
+    media_line_idx: Optional[int] = None
+    photos_str = ""
+    videos_str = ""
+    inline_title_prefix = ""
+
+    for idx, line in enumerate(clean_lines):
+        m_p = re.search(r"(\d[\d,\s]*[kKmM]?)\s*photos?\b", line, re.IGNORECASE)
+        m_v = re.search(r"(\d[\d,\s]*[kKmM]?)\s*videos?\b", line, re.IGNORECASE)
+        if m_p or m_v:
+            media_line_idx = idx
+            if m_p:
+                photos_str = re.sub(r"[\s,]+", "", m_p.group(1))
+            if m_v:
+                videos_str = re.sub(r"[\s,]+", "", m_v.group(1))
+            first_pos = min(
+                [m.start() for m in (m_p, m_v) if m is not None],
+                default=0,
+            )
+            if first_pos > 1:
+                cand_prefix = line[:first_pos].strip(" ,•-—:|")
+                if len(cand_prefix) >= 2 and not cand_prefix.isdigit():
+                    inline_title_prefix = cand_prefix
+            break
+
+    parts: list[str] = []
+    if photos_str:
+        parts.append(f"{photos_str} photos")
+    if videos_str:
+        parts.append(f"{videos_str} videos")
+    media_counts = ", ".join(parts)
+
+    def _is_valid_title_line(candidate: str) -> bool:
+        c = candidate.strip()
+        if len(c) < 2:
+            return False
+        if c.lower() in _OCR_NOISE_WORDS:
+            return False
+        # Skip pure clock times or battery percentages (e.g. "20:10", "98%")
+        if re.match(r"^\d{1,2}:\d{2}(?:\s*[APap][Mm])?$", c):
+            return False
+        if re.match(r"^\d{1,3}%$", c):
+            return False
+        if re.match(r"^[\d\s,.:;+\-*/=%]+$", c):
+            return False
+        return True
+
+    extracted_name = ""
+    if media_line_idx is not None and media_line_idx > 0:
+        for i in range(media_line_idx - 1, -1, -1):
+            if _is_valid_title_line(clean_lines[i]):
+                extracted_name = clean_lines[i]
+                break
+
+    if not extracted_name and inline_title_prefix and _is_valid_title_line(inline_title_prefix):
+        extracted_name = inline_title_prefix
+
+    if not extracted_name and media_line_idx is None:
+        for line in clean_lines[:3]:
+            if _is_valid_title_line(line):
+                extracted_name = line
+                break
+
+    return extracted_name[:80].strip(), media_counts
+
+
+async def _ocr_image_bytes(img_bytes: bytes) -> str:
+    """Send image bytes to OCR endpoint and return parsed text."""
+    b64 = "data:image/jpeg;base64," + base64.b64encode(img_bytes).decode("ascii")
+    api_key = os.getenv("OCR_SPACE_API_KEY", "helloworld").strip() or "helloworld"
+    resp = await _ASYNC_HTTP_CLIENT.post(
+        "https://api.ocr.space/parse/image",
+        data={
+            "apikey": api_key,
+            "base64Image": b64,
+            "OCREngine": "2",
+        },
+        timeout=18.0,
+    )
+    if resp.status_code != 200:
+        return ""
+    data = resp.json()
+    results = data.get("ParsedResults") or []
+    if results and isinstance(results, list):
+        return str(results[0].get("ParsedText") or "")
+    return ""
+
+
+def _prepare_image_crops_for_ocr(raw_bytes: bytes) -> list[bytes]:
+    """
+    Prepare JPEG byte payloads for OCR:
+    - If image is a tall screenshot (h > w * 0.75 and h > 300), prepare top-40% header crop first,
+      followed by full resized image as fallback.
+    - Otherwise prepare the full image (resized if large).
+    """
+    im = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    w, h = im.size
+    outputs: list[bytes] = []
+
+    if h > int(w * 0.75) and h > 300:
+        crop = im.crop((0, 0, w, int(h * 0.40)))
+        buf_crop = io.BytesIO()
+        crop.save(buf_crop, format="JPEG", quality=90)
+        outputs.append(buf_crop.getvalue())
+
+    if max(w, h) > 1400:
+        scale = 1400.0 / max(w, h)
+        im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+
+    buf_full = io.BytesIO()
+    im.save(buf_full, format="JPEG", quality=88)
+    outputs.append(buf_full.getvalue())
+    return outputs
+
+
+async def extract_channel_metadata_from_file_id(bot, photo_file_id: str) -> tuple[str, str]:
+    """
+    Download Telegram photo by file_id and extract (channel_name, media_counts) via OCR.
+    Returns ('', '') if photo cannot be processed.
+    """
+    if not bot or not photo_file_id:
+        return "", ""
+    clean_fid = str(photo_file_id).split("-100")[0].strip()
+    if not clean_fid.startswith("AgAC"):
+        return "", ""
+
+    if clean_fid in _IMAGE_OCR_CACHE:
+        return _IMAGE_OCR_CACHE[clean_fid]
+
+    try:
+        tg_file = await bot.get_file(clean_fid)
+        raw_bytearray = await tg_file.download_as_bytearray()
+        raw_bytes = bytes(raw_bytearray)
+        payloads = await asyncio.to_thread(_prepare_image_crops_for_ocr, raw_bytes)
+
+        best_name = ""
+        best_media = ""
+        for payload in payloads:
+            ocr_text = await _ocr_image_bytes(payload)
+            name, media = parse_channel_header_ocr_text(ocr_text)
+            if name and not best_name:
+                best_name = name
+            if media and not best_media:
+                best_media = media
+            if best_name and best_media:
+                break
+
+        if best_name or best_media:
+            _IMAGE_OCR_CACHE[clean_fid] = (best_name, best_media)
+            logger.info(
+                "[IMAGE OCR] Extracted from %s -> name=%r, media=%r",
+                clean_fid[:24], best_name, best_media,
+            )
+        return best_name, best_media
+    except Exception as exc:
+        logger.warning("[IMAGE OCR] Could not extract metadata from %s: %s", clean_fid[:24], exc)
+        return "", ""
+
+
+def extract_clean_title_from_alive_detail(detail: str) -> str:
+    """Extract clean channel title from check_channel_link_alive detail string."""
+    if not detail:
+        return ""
+    cleaned = re.sub(r"\s*\(\d[\d\s,]*\s*(?:subscribers?|members?|online)[^)]*\)\s*$", "", detail, flags=re.I).strip()
+    if cleaned.lower() in (
+        "active", "active (invite link valid)", "active (telegram invite page)",
+        "join group chat on telegram", "telegram",
+    ) or cleaned.lower().startswith("active ("):
+        return ""
+    return cleaned
 
 
 async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[bool, str]:
@@ -3713,9 +3927,14 @@ async def cmd_postfree(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def post_get_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     """Receive photo, video, animation, or handle skip for broadcast post, then immediately prompt for channel."""
     msg = update.message
+    ctx.user_data.pop("post_ocr_task", None)
     if msg.photo:
-        ctx.user_data["post_photo"] = msg.photo[-1].file_id
+        photo_fid = msg.photo[-1].file_id
+        ctx.user_data["post_photo"] = photo_fid
         ctx.user_data["post_media_type"] = "photo"
+        ctx.user_data["post_ocr_task"] = asyncio.create_task(
+            extract_channel_metadata_from_file_id(ctx.bot, photo_fid)
+        )
         if msg.caption:
             ctx.user_data["post_text"] = msg.caption_html or msg.caption
     elif msg.video:
@@ -3820,6 +4039,23 @@ async def cb_post_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         await query.edit_message_text("❌ Channel not found. Cancelled.")
         return ConversationHandler.END
 
+    # If a screenshot photo was uploaded in Step 1, auto-update channel name & photo/video counts
+    ocr_task = ctx.user_data.pop("post_ocr_task", None)
+    if ocr_task:
+        try:
+            ocr_name, ocr_media = await asyncio.wait_for(ocr_task, timeout=12.0)
+            updates = {}
+            if ocr_name:
+                updates["name"] = ocr_name
+            if ocr_media:
+                updates["media_counts"] = ocr_media
+            if updates:
+                db.update_channel(DB_PATH, channel_id, **updates)
+                invalidate_channel_cache()
+                channel = db.get_channel(DB_PATH, channel_id) or channel
+        except Exception as exc:
+            logger.debug("OCR task in cb_post_channel skipped: %s", exc)
+
     ctx.user_data["post_channel_id"] = channel_id
     ctx.user_data["channel_default_price"] = channel["price_inr"]
 
@@ -3866,20 +4102,49 @@ async def post_get_channel_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
         )
         return POST_CHANNEL
 
+    # Extract channel name & photo/video counts from uploaded screenshot image (if any) + channel link
+    ocr_name, ocr_media = "", ""
+    ocr_task = ctx.user_data.pop("post_ocr_task", None)
+    if ocr_task:
+        try:
+            ocr_name, ocr_media = await asyncio.wait_for(ocr_task, timeout=12.0)
+        except Exception as exc:
+            logger.debug("OCR task in post_get_channel_link skipped: %s", exc)
+    elif ctx.user_data.get("post_photo"):
+        ocr_name, ocr_media = await extract_channel_metadata_from_file_id(
+            ctx.bot, ctx.user_data["post_photo"]
+        )
+
+    if not ocr_media and ctx.user_data.get("post_text"):
+        _, cap_media = parse_channel_header_ocr_text(ctx.user_data["post_text"])
+        if cap_media:
+            ocr_media = cap_media
+
+    link_title = extract_clean_title_from_alive_detail(reason)
+    detected_name = ocr_name or link_title
+
     existing_ch = db.get_channel_by_link(DB_PATH, link)
     if existing_ch:
         channel_id = existing_ch["id"]
         channel_name = existing_ch["name"]
-        db.update_channel(DB_PATH, channel_id, is_active=1)
+        updates: dict = {"is_active": 1}
+        if detected_name and (
+            ocr_name or re.match(r"^VIP Channel #\d+$", channel_name or "", re.IGNORECASE)
+        ):
+            channel_name = detected_name
+            updates["name"] = channel_name
+        if ocr_media:
+            updates["media_counts"] = ocr_media
+        db.update_channel(DB_PATH, channel_id, **updates)
         invalidate_channel_cache()
         ctx.user_data["post_channel_id"] = channel_id
         ctx.user_data["channel_default_price"] = existing_ch["price_inr"] or 0.0
     else:
         admin_id = update.effective_user.id
         count = len(db.get_all_channels(DB_PATH)) + 1
-        channel_name = f"VIP Channel #{count}"
+        channel_name = detected_name or f"VIP Channel #{count}"
 
-        # Automatically save channel to database with attractive emoji description
+        # Automatically save channel to database with extracted name and photo/video counts
         channel_id = db.add_channel(
             DB_PATH,
             name=channel_name,
@@ -3887,6 +4152,7 @@ async def post_get_channel_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
             price_inr=0.0,
             description="🌟 Exclusive VIP Access • Daily Premium Content & Updates 🚀",
             admin_id=admin_id,
+            media_counts=ocr_media or None,
         )
         invalidate_channel_cache()
 
@@ -4497,6 +4763,67 @@ async def handle_chat_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYP
 # MAIN — SETUP & RUN
 # ──────────────────────────────────────────────────────────────────────────────
 
+async def backfill_channels_metadata_worker(bot) -> None:
+    """
+    Background startup task: for any existing channels that still have a generic
+    'VIP Channel #N' name or missing photo/video counts, extract the real channel name
+    and photo/video counts from their saved post screenshot image (OCR) and channel link.
+    """
+    try:
+        all_channels = await asyncio.to_thread(db.get_all_channels, DB_PATH)
+        updated_any = False
+        for ch in all_channels:
+            cid = ch["id"]
+            cur_name = (row_get(ch, "name") or "").strip()
+            cur_media = (row_get(ch, "media_counts") or "").strip()
+            link = (row_get(ch, "link") or "").strip()
+            is_generic_name = bool(re.match(r"^VIP Channel #\d+$", cur_name, re.IGNORECASE))
+
+            if not is_generic_name and cur_media:
+                continue
+
+            ocr_name, ocr_media = "", ""
+            latest_post = await asyncio.to_thread(
+                db.get_latest_post_for_channel, DB_PATH, cid, link, cur_name
+            )
+            if latest_post and latest_post["photo_file_id"]:
+                fid = str(latest_post["photo_file_id"]).split("-100")[0].strip()
+                if fid.startswith("AgAC"):
+                    ocr_name, ocr_media = await extract_channel_metadata_from_file_id(bot, fid)
+                    await asyncio.sleep(1.2)
+
+            if not ocr_media and latest_post and latest_post["caption"]:
+                _, cap_media = parse_channel_header_ocr_text(latest_post["caption"])
+                if cap_media:
+                    ocr_media = cap_media
+
+            if is_generic_name and not ocr_name and link:
+                is_alive, detail = await check_channel_link_alive(
+                    link, bot=bot, chat_id=row_get(ch, "chat_id")
+                )
+                if is_alive:
+                    ocr_name = extract_clean_title_from_alive_detail(detail)
+
+            updates: dict = {}
+            if is_generic_name and ocr_name:
+                updates["name"] = ocr_name
+            if not cur_media and ocr_media:
+                updates["media_counts"] = ocr_media
+
+            if updates:
+                await asyncio.to_thread(db.update_channel, DB_PATH, cid, **updates)
+                updated_any = True
+                logger.info("Backfilled channel #%d metadata: %s", cid, updates)
+
+        if updated_any:
+            invalidate_channel_cache()
+            logger.info("Completed channel name & photo/video count backfill for /menu.")
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        logger.warning("Error in backfill_channels_metadata_worker: %s", exc)
+
+
 async def post_init(app: Application) -> None:
     """Start Webhook server, background poller, and set bot commands."""
     global BOT_ID, BOT_USERNAME
@@ -4558,9 +4885,11 @@ async def post_init(app: Application) -> None:
     except Exception as exc:
         logger.warning("Could not run channel recovery in post_init: %s", exc)
 
-    # 3. Start background auto-poller worker
+    # 3. Start background auto-poller worker & channel metadata backfill worker
     poller_task = asyncio.create_task(poll_pending_payments(app.bot))
     app.bot_data["poller_task"] = poller_task
+    backfill_task = asyncio.create_task(backfill_channels_metadata_worker(app.bot))
+    app.bot_data["backfill_task"] = backfill_task
 
     # 4. Set bot commands
     user_cmds = [
