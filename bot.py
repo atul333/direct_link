@@ -38,6 +38,7 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 from datetime import datetime
 from typing import Optional
 
@@ -297,14 +298,38 @@ def _format_media_badge(media_counts: str) -> str:
     return ""
 
 
-def format_channel_menu_label(c, index: int = 1) -> str:
+def _visual_em_width(text: str) -> float:
+    """Estimate visual proportional-font width (in em units relative to \u2800 Braille blank = 1.0)."""
+    total = 0.0
+    for ch in text:
+        code = ord(ch)
+        if ch in ("\u200e", "\u200f", "\u2066", "\u2069", "\ufe0f", "\u200d"):
+            continue
+        if ch in "1ilI.,:!|' ":
+            total += 0.45
+        elif ch in "frtJ()-":
+            total += 0.60
+        elif ch in "MWm@":
+            total += 1.25
+        elif "A" <= ch <= "Z":
+            total += 1.05
+        elif code > 0x2E80:
+            total += 1.75
+        else:
+            total += 0.85
+    return total
+
+
+def format_channel_menu_label(c, index: int = 1, target_em: float = 50.0) -> str:
     """
     Format /menu button label with:
     - 1, 2, 3... sequential nomenclature
     - Exactly 1 distinct adult emoji per row
     - Price first, then Channel Name, then Videos count (no photos/images count)
+    - Right-padded with non-collapsing Braille blanks (\u2800) + \u200e so Telegram pushes
+      the text all the way to the LEFT side of the button instead of centering in the middle.
     """
-    raw_name = (row_get(c, "name") or "").strip()
+    raw_name = unicodedata.normalize("NFKC", (row_get(c, "name") or "").strip())
     clean_name = _STRIP_TITLE_EMOJIS_RE.sub("", raw_name)
     clean_name = re.sub(r"\s+", " ", clean_name).strip(" •-—:|")
     if not clean_name or re.match(r"^(?:VIP\s*)?Channel\s*#?\d+$", clean_name, re.IGNORECASE):
@@ -315,12 +340,18 @@ def format_channel_menu_label(c, index: int = 1) -> str:
     price_tag = "FREE" if price_val <= 0 else f"₹{price_val:.0f}"
 
     videos_badge = _format_media_badge(row_get(c, "media_counts") or "")
-    # Isolate channel name direction with LRM + FSI/PDI (\u200e\u2066...\u2069\u200e) so Arabic/RTL names never flip the row
     safe_name = f"\u2066{clean_name}\u2069\u200e"
 
     if videos_badge:
-        return f"\u200e{index}. {lead_emoji} {price_tag} • {safe_name} • {videos_badge}"
-    return f"\u200e{index}. {lead_emoji} {price_tag} • {safe_name}"
+        core_label = f"\u200e{index}. {lead_emoji} {price_tag} • {safe_name} • {videos_badge}"
+    else:
+        core_label = f"\u200e{index}. {lead_emoji} {price_tag} • {safe_name}"
+
+    cur_em = _visual_em_width(core_label)
+    pad_count = max(0, int(round(target_em - cur_em)))
+    if pad_count > 0:
+        return core_label + ("\u2800" * pad_count) + "\u200e"
+    return core_label + "\u200e"
 
 
 def channel_list_keyboard(
@@ -343,7 +374,7 @@ def channel_list_keyboard(
 
     for idx, c in enumerate(sorted_channels, 1):
         buttons.append([InlineKeyboardButton(
-            format_channel_menu_label(c, index=idx),
+            format_channel_menu_label(c, index=idx, target_em=50.0),
             callback_data=f"{prefix}:{c['id']}"
         )])
     return InlineKeyboardMarkup(buttons)
