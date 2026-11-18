@@ -99,10 +99,20 @@ _active_channels_cache_time: float = 0.0
 _CHANNEL_CACHE_TTL: float = 60.0
 
 def get_active_channels_cached() -> list:
-    """Return active channels from memory; refresh every 60 s."""
+    """Return active deduplicated channels from memory; refresh every 60 s."""
     global _active_channels_cache, _active_channels_cache_time
     if not _active_channels_cache or (time.time() - _active_channels_cache_time > _CHANNEL_CACHE_TTL):
-        _active_channels_cache = db.get_active_channels(DB_PATH)
+        rows = db.get_active_channels(DB_PATH)
+        seen_links: set[str] = set()
+        deduped: list = []
+        for r in sorted(rows, key=lambda x: x["id"], reverse=True):
+            lnk = (r["link"] or "").strip().rstrip("/").lower()
+            if not lnk or lnk in seen_links:
+                continue
+            seen_links.add(lnk)
+            deduped.append(r)
+        deduped.sort(key=lambda x: x["id"])
+        _active_channels_cache = deduped
         _active_channels_cache_time = time.time()
     return _active_channels_cache
 
@@ -4968,24 +4978,86 @@ async def handle_chat_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYP
 # MAIN — SETUP & RUN
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def backfill_channels_metadata_worker(bot) -> None:
+async def verify_and_prune_active_channels_fast(bot) -> list:
     """
-    Background startup task: for active channels first (then inactive), extract the real
-    channel name and photo/video counts from their saved post screenshot image (OCR) and channel link.
+    Fast startup pass: deduplicate active channels and verify each link is live.
+    Any expired, banned, or dead channel is immediately set to is_active=0 in DB
+    so ONLY working active channels appear in /menu.
+    """
+    active_channels = await asyncio.to_thread(db.get_active_channels, DB_PATH)
+    if not active_channels:
+        return []
+
+    seen_keys: dict[str, int] = {}
+    unique_channels = []
+    for ch in sorted(active_channels, key=lambda r: r["id"], reverse=True):
+        cid = ch["id"]
+        link = (row_get(ch, "link") or "").strip()
+        key = _canonical_telegram_link_key(link)
+        if not link or (key and key in seen_keys):
+            await asyncio.to_thread(db.update_channel, DB_PATH, cid, is_active=0)
+            logger.info("Deactivated duplicate/empty channel #%d (%s) from /menu.", cid, ch["name"])
+            continue
+        if key:
+            seen_keys[key] = cid
+        unique_channels.append(ch)
+
+    unique_channels.sort(key=lambda r: r["id"])
+    sem = asyncio.Semaphore(6)
+    live_channels = []
+
+    async def _check_one(ch):
+        cid = ch["id"]
+        cur_name = (row_get(ch, "name") or "").strip()
+        link = (row_get(ch, "link") or "").strip()
+        chat_id = row_get(ch, "chat_id")
+        is_generic_name = bool(re.match(r"^VIP Channel #\d+$", cur_name, re.IGNORECASE))
+
+        async with sem:
+            is_alive, detail = await check_channel_link_alive(link, bot=bot, chat_id=chat_id)
+            if not is_alive and not any(w in detail.lower() for w in ("rate limit", "connection error", "busy")):
+                await asyncio.sleep(0.5)
+                is_alive, detail = await check_channel_link_alive(link, bot=bot, chat_id=chat_id)
+
+        if not is_alive and not any(w in detail.lower() for w in ("rate limit", "connection error", "busy")):
+            await asyncio.to_thread(db.update_channel, DB_PATH, cid, is_active=0)
+            logger.info(
+                "Deactivated expired/dead channel #%d (%s) so only active channels show in /menu: %s",
+                cid, cur_name, detail,
+            )
+            return None
+
+        if is_alive and is_generic_name:
+            link_title = extract_clean_title_from_alive_detail(detail)
+            if link_title:
+                await asyncio.to_thread(db.update_channel, DB_PATH, cid, name=link_title)
+        return ch
+
+    results = await asyncio.gather(*(_check_one(c) for c in unique_channels), return_exceptions=True)
+    for res in results:
+        if isinstance(res, (dict, object)) and res is not None and not isinstance(res, Exception):
+            live_channels.append(res)
+
+    invalidate_channel_cache()
+    return live_channels
+
+
+async def backfill_channels_metadata_worker(bot, live_active_channels: Optional[list] = None) -> None:
+    """
+    Background task: extract photo/video counts & header title via OCR for live active channels.
     """
     try:
-        await asyncio.to_thread(db.recover_deleted_posts_from_sqlite_bytes, DB_PATH)
-        active_channels = await asyncio.to_thread(db.get_active_channels, DB_PATH)
-        all_channels = await asyncio.to_thread(db.get_all_channels, DB_PATH)
-        active_ids = {c["id"] for c in active_channels}
-        ordered_channels = list(active_channels) + [c for c in all_channels if c["id"] not in active_ids]
+        if live_active_channels is None:
+            live_active_channels = await verify_and_prune_active_channels_fast(bot)
 
-        updated_any = False
-        for ch in ordered_channels:
+        for ch in live_active_channels:
             cid = ch["id"]
-            cur_name = (row_get(ch, "name") or "").strip()
-            cur_media = (row_get(ch, "media_counts") or "").strip()
-            link = (row_get(ch, "link") or "").strip()
+            fresh_ch = await asyncio.to_thread(db.get_channel, DB_PATH, cid) or ch
+            if not row_get(fresh_ch, "is_active", 1):
+                continue
+            cur_name = (row_get(fresh_ch, "name") or "").strip()
+            cur_media = (row_get(fresh_ch, "media_counts") or "").strip()
+            link = (row_get(fresh_ch, "link") or "").strip()
             is_generic_name = bool(re.match(r"^VIP Channel #\d+$", cur_name, re.IGNORECASE))
 
             if not is_generic_name and cur_media:
@@ -5011,13 +5083,6 @@ async def backfill_channels_metadata_worker(bot) -> None:
                 if cap_media:
                     ocr_media = cap_media
 
-            if is_generic_name and not ocr_name and link:
-                is_alive, detail = await check_channel_link_alive(
-                    link, bot=bot, chat_id=row_get(ch, "chat_id")
-                )
-                if is_alive:
-                    ocr_name = extract_clean_title_from_alive_detail(detail)
-
             updates: dict = {}
             if is_generic_name and ocr_name:
                 updates["name"] = ocr_name
@@ -5027,12 +5092,9 @@ async def backfill_channels_metadata_worker(bot) -> None:
             if updates:
                 await asyncio.to_thread(db.update_channel, DB_PATH, cid, **updates)
                 invalidate_channel_cache()
-                updated_any = True
-                logger.info("Backfilled channel #%d metadata: %s", cid, updates)
+                logger.info("Backfilled active channel #%d metadata: %s", cid, updates)
 
-        if updated_any:
-            invalidate_channel_cache()
-            logger.info("Completed channel name & photo/video count backfill for /menu.")
+        logger.info("Completed active channels verification & metadata backfill for /menu.")
     except asyncio.CancelledError:
         return
     except Exception as exc:
@@ -5057,53 +5119,21 @@ async def post_init(app: Application) -> None:
     except Exception as exc:
         logger.error("Failed to start webhook server on port %d: %s", WEBHOOK_PORT, exc)
 
-    # 2. Auto-recover deleted post images from SQLite bytes & reactivate falsely deactivated invite channels
+    # 2. Recover deleted post photo_file_ids & prune any expired/dead channels before serving /menu
+    live_channels = None
     try:
         carved_count = await asyncio.to_thread(db.recover_deleted_posts_from_sqlite_bytes, DB_PATH)
         if carved_count:
             logger.info("Recovered %d deleted post record(s) (with photo/video file_ids) from SQLite storage.", carved_count)
-
-        all_channels = await asyncio.to_thread(db.get_all_channels, DB_PATH)
-        recovered_count = 0
-        reposted_count = 0
-        for ch in all_channels:
-            link = (row_get(ch, "link") or "").strip()
-            is_invite_link = "/+" in link or "joinchat" in link
-            was_inactive = not row_get(ch, "is_active", 1)
-            if was_inactive and is_invite_link:
-                await asyncio.to_thread(db.update_channel, DB_PATH, ch["id"], is_active=1)
-                recovered_count += 1
-                logger.info(
-                    "Auto-reactivated invite channel #%d (%s): %s",
-                    ch["id"], ch["name"], link,
-                )
-            # If this invite channel had its post removed from the Main Channel, auto-repost it with its recovered image!
-            if is_invite_link:
-                latest_post = await asyncio.to_thread(
-                    db.get_latest_post_for_channel, DB_PATH, ch["id"], link, ch["name"]
-                )
-                if latest_post and latest_post["photo_file_id"] and not latest_post["channel_msg_id"]:
-                    ok, info, msg_id = await republish_channel_post(app.bot, ch["id"])
-                    if ok:
-                        reposted_count += 1
-                        logger.info(
-                            "Auto-republished recovered post for channel #%d (%s) to %s (msg_id=%s)",
-                            ch["id"], ch["name"], info, msg_id,
-                        )
-                        await asyncio.sleep(1.0)
-        if recovered_count or reposted_count:
-            invalidate_channel_cache()
-            logger.info(
-                "Startup recovery complete: %d channel(s) reactivated, %d post(s) re-published to Main Channel.",
-                recovered_count, reposted_count,
-            )
+        live_channels = await verify_and_prune_active_channels_fast(app.bot)
+        logger.info("Verified %d active working channel(s) for /menu.", len(live_channels))
     except Exception as exc:
-        logger.warning("Could not run channel recovery in post_init: %s", exc)
+        logger.warning("Could not run active channel verification in post_init: %s", exc)
 
     # 3. Start background auto-poller worker & channel metadata backfill worker
     poller_task = asyncio.create_task(poll_pending_payments(app.bot))
     app.bot_data["poller_task"] = poller_task
-    backfill_task = asyncio.create_task(backfill_channels_metadata_worker(app.bot))
+    backfill_task = asyncio.create_task(backfill_channels_metadata_worker(app.bot, live_channels))
     app.bot_data["backfill_task"] = backfill_task
 
     # 4. Set bot commands
