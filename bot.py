@@ -320,6 +320,43 @@ def _visual_em_width(text: str) -> float:
     return total
 
 
+MENU_PAGE_SIZE = 20
+ADMIN_PAGE_SIZE = 20
+PURCHASES_PAGE_SIZE = 20
+TELEGRAM_MAX_REPLY_MARKUP_BYTES = 9200  # Telegram hard limit is 10,240 bytes
+
+
+def _markup_json_size(markup: InlineKeyboardMarkup) -> int:
+    """Measure serialized JSON size using ASCII escaping (worst-case PTB wire size)."""
+    return len(json.dumps(markup.to_dict(), ensure_ascii=True).encode("utf-8"))
+
+
+def build_menu_text(
+    total_channels: int, page: int = 0, page_size: int = MENU_PAGE_SIZE
+) -> str:
+    """Build the /menu header text including current page range when paginated."""
+    if total_channels <= 0:
+        return "😔 No channels available right now."
+    total_pages = max(1, (total_channels + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    start_num = page * page_size + 1
+    end_num = min(total_channels, (page + 1) * page_size)
+    page_line = (
+        f"📄 <i>Showing {start_num}–{end_num} of {total_channels} channels (Page {page + 1}/{total_pages})</i>\n"
+        if total_pages > 1
+        else f"📊 <i>Total Active Channels: {total_channels}</i>\n"
+    )
+    return (
+        "<blockquote><b>🔞 EXCLUSIVE VIP CHANNELS DIRECTORY 🔥</b></blockquote>\n"
+        "<blockquote>✨ Select any VIP channel below to view full details, perks & unlock instant access:\n\n"
+        "💰 <i>Tap the sort buttons below to sort channels by price (Low ➔ High or High ➔ Low)</i>\n"
+        "⚡ <i>Instant automated UPI payment • Protected 1-click delivery</i>\n"
+        f"{page_line}"
+        "──────────────────────────\n"
+        f"🏆 Admin - {ADMIN_CONTACT}</blockquote>"
+    )
+
+
 def format_channel_menu_label(c, index: int = 1, target_em: float = 50.0) -> str:
     """
     Format /menu button label with:
@@ -334,6 +371,8 @@ def format_channel_menu_label(c, index: int = 1, target_em: float = 50.0) -> str
     clean_name = re.sub(r"\s+", " ", clean_name).strip(" •-—:|")
     if not clean_name or re.match(r"^(?:VIP\s*)?Channel\s*#?\d+$", clean_name, re.IGNORECASE):
         clean_name = "VIP Exclusive"
+    if len(clean_name) > 36:
+        clean_name = clean_name[:35].rstrip() + "…"
 
     lead_emoji = _ADULT_MENU_EMOJIS[(max(1, index) - 1) % len(_ADULT_MENU_EMOJIS)]
     price_val = float(row_get(c, "price_inr", 0) or 0)
@@ -347,15 +386,20 @@ def format_channel_menu_label(c, index: int = 1, target_em: float = 50.0) -> str
     else:
         core_label = f"\u200e{index}. {lead_emoji} {price_tag} • {safe_name}"
 
-    cur_em = _visual_em_width(core_label)
-    pad_count = max(0, int(round(target_em - cur_em)))
-    if pad_count > 0:
-        return core_label + ("\u2800" * pad_count) + "\u200e"
+    if target_em > 0:
+        cur_em = _visual_em_width(core_label)
+        pad_count = max(0, int(round(target_em - cur_em)))
+        if pad_count > 0:
+            return core_label + ("\u2800" * pad_count) + "\u200e"
     return core_label + "\u200e"
 
 
 def channel_list_keyboard(
-    channels: list, prefix: str = "buy", sort_by: str = "default"
+    channels: list,
+    prefix: str = "buy",
+    sort_by: str = "default",
+    page: int = 0,
+    page_size: int = MENU_PAGE_SIZE,
 ) -> InlineKeyboardMarkup:
     sorted_channels = list(channels)
     if sort_by == "price_asc":
@@ -363,31 +407,140 @@ def channel_list_keyboard(
     elif sort_by == "price_desc":
         sorted_channels.sort(key=lambda c: (-float(row_get(c, "price_inr", 0) or 0), c["id"]))
 
-    buttons = []
-    if prefix == "view" and len(sorted_channels) > 1:
-        asc_txt = "✅ 💰 Price: Low ➔ High" if sort_by == "price_asc" else "💰 Price: Low ➔ High"
-        desc_txt = "✅ 💎 Price: High ➔ Low" if sort_by == "price_desc" else "💎 Price: High ➔ Low"
-        buttons.append([
-            InlineKeyboardButton(asc_txt, callback_data="menu_sort:price_asc"),
-            InlineKeyboardButton(desc_txt, callback_data="menu_sort:price_desc"),
-        ])
+    total = len(sorted_channels)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    start = page * page_size
+    page_channels = sorted_channels[start : start + page_size]
 
-    for idx, c in enumerate(sorted_channels, 1):
-        buttons.append([InlineKeyboardButton(
-            format_channel_menu_label(c, index=idx, target_em=50.0),
+    def _build_markup(target_em: float, items: list) -> InlineKeyboardMarkup:
+        buttons = []
+        if prefix == "view" and total > 1:
+            asc_txt = "✅ 💰 Price: Low ➔ High" if sort_by == "price_asc" else "💰 Price: Low ➔ High"
+            desc_txt = "✅ 💎 Price: High ➔ Low" if sort_by == "price_desc" else "💎 Price: High ➔ Low"
+            buttons.append([
+                InlineKeyboardButton(asc_txt, callback_data="menu_sort:price_asc"),
+                InlineKeyboardButton(desc_txt, callback_data="menu_sort:price_desc"),
+            ])
+
+        for idx, c in enumerate(items, start + 1):
+            buttons.append([InlineKeyboardButton(
+                format_channel_menu_label(c, index=idx, target_em=target_em),
+                callback_data=f"{prefix}:{c['id']}"
+            )])
+
+        if prefix == "view" and total_pages > 1:
+            nav_row = []
+            if page > 0:
+                nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"menu_page:{page - 1}"))
+            nav_row.append(InlineKeyboardButton(f"📄 Page {page + 1}/{total_pages}", callback_data="menu_noop"))
+            if page < total_pages - 1:
+                nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"menu_page:{page + 1}"))
+            buttons.append(nav_row)
+
+        return InlineKeyboardMarkup(buttons)
+
+    # Keep full left-alignment padding (50.0 em) whenever it fits under Telegram's 10 KB limit;
+    # gracefully reduce padding only if a page has unusually long multi-byte titles.
+    for target_em in (50.0, 38.0, 26.0, 0.0):
+        markup = _build_markup(target_em, page_channels)
+        if _markup_json_size(markup) <= TELEGRAM_MAX_REPLY_MARKUP_BYTES:
+            return markup
+
+    # Absolute last-resort safety cap so Telegram never rejects with "Reply markup is too long"
+    trimmed = list(page_channels)
+    while len(trimmed) > 1:
+        trimmed.pop()
+        markup = _build_markup(0.0, trimmed)
+        if _markup_json_size(markup) <= TELEGRAM_MAX_REPLY_MARKUP_BYTES:
+            return markup
+    return _build_markup(0.0, trimmed)
+
+
+def admin_channel_keyboard(
+    channels: list,
+    prefix: str,
+    page: int = 0,
+    page_size: int = ADMIN_PAGE_SIZE,
+) -> InlineKeyboardMarkup:
+    total = len(channels)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    start = page * page_size
+    page_channels = channels[start : start + page_size]
+
+    buttons = [
+        [InlineKeyboardButton(
+            f"[{c['id']}] {(c['name'] or '')[:32]} ({'✅' if c['is_active'] else '❌'})",
             callback_data=f"{prefix}:{c['id']}"
-        )])
+        )]
+        for c in page_channels
+    ]
+    if total_pages > 1:
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"adm_ch_page:{prefix}:{page - 1}"))
+        nav_row.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="menu_noop"))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"adm_ch_page:{prefix}:{page + 1}"))
+        buttons.append(nav_row)
     return InlineKeyboardMarkup(buttons)
 
 
-def admin_channel_keyboard(channels: list, prefix: str) -> InlineKeyboardMarkup:
+def build_mypurchases_keyboard(
+    purchases: list,
+    page: int = 0,
+    page_size: int = PURCHASES_PAGE_SIZE,
+) -> InlineKeyboardMarkup:
+    total = len(purchases)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    start = page * page_size
+    page_items = purchases[start : start + page_size]
+
     buttons = [
-        [InlineKeyboardButton(
-            f"[{c['id']}] {c['name']} ({'✅' if c['is_active'] else '❌'})",
-            callback_data=f"{prefix}:{c['id']}"
-        )]
-        for c in channels
+        [InlineKeyboardButton(f"✨ {(p['name'] or '')[:36]} 🔓", callback_data=f"getlink:{p['id']}")]
+        for p in page_items
     ]
+    if total_pages > 1:
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"mypurch_page:{page - 1}"))
+        nav_row.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="menu_noop"))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"mypurch_page:{page + 1}"))
+        buttons.append(nav_row)
+    buttons.append([InlineKeyboardButton("🛍️ Browse More Channels", callback_data="back_menu")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_post_channel_keyboard(
+    channels: list,
+    is_free: bool = False,
+    page: int = 0,
+    page_size: int = ADMIN_PAGE_SIZE,
+) -> InlineKeyboardMarkup:
+    total = len(channels)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    start = page * page_size
+    page_channels = channels[start : start + page_size]
+
+    buttons = [[InlineKeyboardButton("➕ Paste New Invite Link", callback_data="post_ch:new")]]
+    for c in page_channels:
+        p_label = "FREE 🎁" if (is_free or float(c["price_inr"] or 0) <= 0) else f"₹{c['price_inr']:.0f}"
+        buttons.append([InlineKeyboardButton(
+            f"📌 {(c['name'] or '')[:32]} ({p_label})",
+            callback_data=f"post_ch:{c['id']}"
+        )])
+    if total_pages > 1:
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"post_ch_page:{page - 1}"))
+        nav_row.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="menu_noop"))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"post_ch_page:{page + 1}"))
+        buttons.append(nav_row)
     return InlineKeyboardMarkup(buttons)
 
 
@@ -2786,9 +2939,18 @@ async def handle_admin_forward(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
             ])
 
         channels = get_active_channels_cached()
-        for c in channels:
+        # Prioritize channels without chat_id set (newest first), capped at 25 buttons
+        # so the inline keyboard never exceeds Telegram's 10 KB reply_markup limit.
+        ordered_channels = sorted(
+            channels,
+            key=lambda c: (bool(row_get(c, "chat_id")), -int(c["id"])),
+        )
+        for c in ordered_channels[:25]:
             buttons.append([
-                InlineKeyboardButton(f"🛡️ Link Chat ID to {c['name']} (ID #{c['id']})", callback_data=f"link_cid:{c['id']}:{chat_id}")
+                InlineKeyboardButton(
+                    f"🛡️ Link Chat ID to {(c['name'] or '')[:26]} (ID #{c['id']})",
+                    callback_data=f"link_cid:{c['id']}:{chat_id}",
+                )
             ])
 
         info_lines = [
@@ -2798,6 +2960,11 @@ async def handle_admin_forward(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
         ]
         if fwd_msg_id:
             info_lines.append(f"• <b>Message ID:</b> <code>{fwd_msg_id}</code>")
+        if len(ordered_channels) > 25:
+            info_lines.append(
+                f"\nℹ️ <i>Showing top 25 channels. To link any other channel ID directly, use:</i>\n"
+                f"<code>/setchatid &lt;channel_id&gt; {chat_id}</code>"
+            )
 
         info_lines.append("\n<b>Choose an action:</b>")
         await msg.reply_text(
@@ -3280,18 +3447,13 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     sort_by = ctx.user_data.get("menu_sort", "default") if ctx.user_data is not None else "default"
-    text = (
-        "<blockquote><b>🔞 EXCLUSIVE VIP CHANNELS DIRECTORY 🔥</b></blockquote>\n"
-        "<blockquote>✨ Select any VIP channel below to view full details, perks & unlock instant access:\n\n"
-        "💰 <i>Tap the sort buttons below to sort channels by price (Low ➔ High or High ➔ Low)</i>\n"
-        "⚡ <i>Instant automated UPI payment • Protected 1-click delivery</i>\n"
-        "──────────────────────────\n"
-        f"🏆 Admin - {ADMIN_CONTACT}</blockquote>"
-    )
+    if ctx.user_data is not None:
+        ctx.user_data["menu_page"] = 0
+    text = build_menu_text(len(channels), page=0)
     await reply_or_send_text(
         update, ctx,
         text,
-        reply_markup=channel_list_keyboard(channels, "view", sort_by=sort_by),
+        reply_markup=channel_list_keyboard(channels, "view", sort_by=sort_by, page=0),
     )
 
 
@@ -3322,17 +3484,34 @@ async def cmd_mypurchases(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         "<blockquote>✨ Tap on any channel below to retrieve your private, protected access link:\n\n"
         "🔒 <i>Links are bound to your account and protected against sharing.</i></blockquote>"
     )
-    buttons = [
-        [InlineKeyboardButton(f"✨ {p['name']} 🔓", callback_data=f"getlink:{p['id']}")]
-        for p in purchases
-    ]
-    buttons.append([InlineKeyboardButton("🛍️ Browse More Channels", callback_data="back_menu")])
     await reply_or_send_text(
         update, ctx,
         text,
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=build_mypurchases_keyboard(purchases, page=0),
         protect_content=True,
     )
+
+
+async def cb_mypurchases_page(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Paginate /mypurchases list cleanly when a user has many purchases."""
+    query = update.callback_query
+    try:
+        page = max(0, int(query.data.split(":", 1)[1]))
+    except (IndexError, ValueError):
+        page = 0
+    purchases = await db_get_user_purchases(query.from_user.id)
+    if not purchases:
+        await query.answer("No purchases found.")
+        return
+    total_pages = max(1, (len(purchases) + PURCHASES_PAGE_SIZE - 1) // PURCHASES_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    await query.answer(f"📄 Page {page + 1}/{total_pages}")
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=build_mypurchases_keyboard(purchases, page=page)
+        )
+    except Exception:
+        pass
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3612,26 +3791,33 @@ async def cb_back_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     channels = get_active_channels_cached()
     sort_by = ctx.user_data.get("menu_sort", "default") if ctx.user_data is not None else "default"
-    text = (
-        "<blockquote><b>🔞 EXCLUSIVE VIP CHANNELS DIRECTORY 🔥</b></blockquote>\n"
-        "<blockquote>✨ Select any VIP channel below to view full details, perks & unlock instant access:\n\n"
-        "💰 <i>Tap the sort buttons below to sort channels by price (Low ➔ High or High ➔ Low)</i>\n"
-        "⚡ <i>Instant automated UPI payment • Protected 1-click delivery</i>\n"
-        "──────────────────────────\n"
-        f"🏆 Admin - {ADMIN_CONTACT}</blockquote>"
-        if channels
-        else "😔 No channels available right now."
-    )
-    markup = channel_list_keyboard(channels, "view", sort_by=sort_by) if channels else None
+    page = ctx.user_data.get("menu_page", 0) if ctx.user_data is not None else 0
+    if channels:
+        total_pages = max(1, (len(channels) + MENU_PAGE_SIZE - 1) // MENU_PAGE_SIZE)
+        page = max(0, min(int(page), total_pages - 1))
+        if ctx.user_data is not None:
+            ctx.user_data["menu_page"] = page
+        text = build_menu_text(len(channels), page=page)
+        markup = channel_list_keyboard(channels, "view", sort_by=sort_by, page=page)
+    else:
+        text = "😔 No channels available right now."
+        markup = None
 
-    try:
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
-    except Exception:
+    # Only edit in-place if the source message actually has text (avoids wasted
+    # 400 BadRequest "There is no text in the message to edit" on QR/photo messages).
+    if query.message and query.message.text:
         try:
-            await query.message.delete()
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
         except Exception:
             pass
-        await reply_or_send_text(update, ctx, text, reply_markup=markup)
+
+    try:
+        if query.message:
+            await query.message.delete()
+    except Exception:
+        pass
+    await reply_or_send_text(update, ctx, text, reply_markup=markup)
 
 
 async def cb_menu_sort(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3643,6 +3829,7 @@ async def cb_menu_sort(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         sort_mode = "default"
     if ctx.user_data is not None:
         ctx.user_data["menu_sort"] = sort_mode
+        ctx.user_data["menu_page"] = 0
 
     if sort_mode == "price_asc":
         await query.answer("💰 Sorted by Price: Low ➔ High")
@@ -3655,11 +3842,53 @@ async def cb_menu_sort(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not channels:
         return
 
-    markup = channel_list_keyboard(channels, "view", sort_by=sort_mode)
+    text = build_menu_text(len(channels), page=0)
+    markup = channel_list_keyboard(channels, "view", sort_by=sort_mode, page=0)
     try:
-        await query.edit_message_reply_markup(reply_markup=markup)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
     except Exception:
-        pass
+        try:
+            await query.edit_message_reply_markup(reply_markup=markup)
+        except Exception:
+            pass
+
+
+async def cb_menu_page(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Prev/Next pagination on the /menu channel directory."""
+    query = update.callback_query
+    try:
+        page = max(0, int(query.data.split(":", 1)[1]))
+    except (IndexError, ValueError):
+        page = 0
+
+    channels = get_active_channels_cached()
+    if not channels:
+        await query.answer("No channels available.")
+        return
+
+    total_pages = max(1, (len(channels) + MENU_PAGE_SIZE - 1) // MENU_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    sort_by = ctx.user_data.get("menu_sort", "default") if ctx.user_data is not None else "default"
+    if ctx.user_data is not None:
+        ctx.user_data["menu_page"] = page
+
+    await query.answer(f"📄 Page {page + 1}/{total_pages}")
+    text = build_menu_text(len(channels), page=page)
+    markup = channel_list_keyboard(channels, "view", sort_by=sort_by, page=page)
+    try:
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except Exception:
+        try:
+            await query.edit_message_reply_markup(reply_markup=markup)
+        except Exception:
+            pass
+
+
+async def cb_menu_noop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Acknowledge non-interactive page indicator button presses."""
+    query = update.callback_query
+    if query:
+        await query.answer()
 
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3793,9 +4022,9 @@ async def cmd_editchannel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         await update.message.reply_text("No channels to edit.")
         return ConversationHandler.END
     await update.message.reply_text(
-        "✏️ <b>Edit Channel</b>\n\nSelect a channel:",
+        f"✏️ <b>Edit Channel</b> ({len(channels)} total)\n\nSelect a channel:",
         parse_mode=ParseMode.HTML,
-        reply_markup=admin_channel_keyboard(channels, "edit_select"),
+        reply_markup=admin_channel_keyboard(channels, "edit_select", page=0),
     )
     return EC_FIELD
 
@@ -4171,9 +4400,39 @@ async def cmd_delchannel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("No channels found.")
         return
     await update.message.reply_text(
-        "🗑️ Select a channel to deactivate:",
-        reply_markup=admin_channel_keyboard(channels, "del_channel"),
+        f"🗑️ Select a channel to deactivate ({len(channels)} total):",
+        reply_markup=admin_channel_keyboard(channels, "del_channel", page=0),
     )
+
+
+async def cb_admin_channel_page(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Paginate /editchannel and /delchannel inline channel pickers safely."""
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("⛔ Admin only.", show_alert=True)
+        return None
+    parts = query.data.split(":")
+    prefix = parts[1] if len(parts) > 1 else "del_channel"
+    try:
+        page = max(0, int(parts[2])) if len(parts) > 2 else 0
+    except ValueError:
+        page = 0
+
+    channels = db.get_all_channels(DB_PATH)
+    if not channels:
+        await query.answer("No channels found.")
+        return EC_FIELD if prefix == "edit_select" else None
+
+    total_pages = max(1, (len(channels) + ADMIN_PAGE_SIZE - 1) // ADMIN_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    await query.answer(f"📄 Page {page + 1}/{total_pages}")
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=admin_channel_keyboard(channels, prefix, page=page)
+        )
+    except Exception:
+        pass
+    return EC_FIELD if prefix == "edit_select" else None
 
 
 async def cb_del_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4201,21 +4460,31 @@ async def cmd_channels(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("No channels in database.")
         return
 
-    lines = ["📋 <b>All Channels</b>\n"]
+    chunks: list[str] = []
+    current = f"📋 <b>All Channels ({len(channels)} total)</b>\n"
     for c in channels:
         status = "✅ Active" if c["is_active"] else "❌ Inactive"
         has_cid = "chat_id" in c.keys() and c["chat_id"]
         cid_info = f"<code>{c['chat_id']}</code> (Join-Request Protected 🛡️)" if has_cid else "Not set (Static link)"
-        lines.append(
-            f"<b>[{c['id']}] {c['name']}</b> — {status}\n"
+        entry = (
+            f"\n<b>[{c['id']}] {html.escape(c['name'] or '')}</b> — {status}\n"
             f"   💰 ₹{c['price_inr']:.0f} | 📅 {c['created_at'][:10]}\n"
             f"   🛡️ Chat ID: {cid_info}\n"
-            f"   🔗 {c['link']}\n"
+            f"   🔗 {html.escape(c['link'] or '')}\n"
         )
-    await update.message.reply_text(
-        "\n".join(lines), parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
+        if len(current) + len(entry) > 3800:
+            chunks.append(current)
+            current = entry.lstrip("\n")
+        else:
+            current += entry
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
+        await update.message.reply_text(
+            chunk, parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -4696,17 +4965,12 @@ async def post_get_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     is_free = ctx.user_data.get("is_free", False)
     step_label = "Step 2/3: Free Channel Link" if is_free else "Step 2/4: Private Channel Link"
     if channels:
-        buttons = []
-        for c in channels:
-            p_label = "FREE 🎁" if (is_free or c["price_inr"] <= 0) else f"₹{c['price_inr']:.0f}"
-            buttons.append([InlineKeyboardButton(f"📌 {c['name']} ({p_label})", callback_data=f"post_ch:{c['id']}")])
-        buttons.append([InlineKeyboardButton("➕ Paste New Invite Link", callback_data="post_ch:new")])
         await update.message.reply_text(
             f"🔗 <b>{step_label}</b>\n\n"
             f"Select an existing channel below, OR directly <b>send/paste a channel invite link</b> (e.g. <code>https://t.me/+...</code>):\n\n"
             f"✨ <i>Description & emojis are generated automatically!</i>",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(buttons),
+            reply_markup=build_post_channel_keyboard(channels, is_free=is_free, page=0),
         )
     else:
         await update.message.reply_text(
@@ -4728,16 +4992,11 @@ async def post_get_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     is_free = ctx.user_data.get("is_free", False)
     step_label = "Step 2/3: Free Channel Link" if is_free else "Step 2/4: Private Channel Link"
     if channels:
-        buttons = []
-        for c in channels:
-            p_label = "FREE 🎁" if (is_free or c["price_inr"] <= 0) else f"₹{c['price_inr']:.0f}"
-            buttons.append([InlineKeyboardButton(f"📌 {c['name']} ({p_label})", callback_data=f"post_ch:{c['id']}")])
-        buttons.append([InlineKeyboardButton("➕ Paste New Invite Link", callback_data="post_ch:new")])
         await update.message.reply_text(
             f"🔗 <b>{step_label}</b>\n\n"
             f"Select an existing channel below, OR directly <b>send/paste a channel invite link</b> (e.g. <code>https://t.me/+...</code>):",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(buttons),
+            reply_markup=build_post_channel_keyboard(channels, is_free=is_free, page=0),
         )
     else:
         await update.message.reply_text(
@@ -4745,6 +5004,30 @@ async def post_get_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             f"Please paste or send the <b>channel invite link</b> (e.g. <code>https://t.me/+abcXYZ123</code>) you are sharing:",
             parse_mode=ParseMode.HTML,
         )
+    return POST_CHANNEL
+
+
+async def cb_post_channel_page(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Paginate existing channel picker inside /post Step 2."""
+    query = update.callback_query
+    try:
+        page = max(0, int(query.data.split(":", 1)[1]))
+    except (IndexError, ValueError):
+        page = 0
+    channels = get_active_channels_cached()
+    if not channels:
+        await query.answer("No channels available.")
+        return POST_CHANNEL
+    total_pages = max(1, (len(channels) + ADMIN_PAGE_SIZE - 1) // ADMIN_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    is_free = ctx.user_data.get("is_free", False)
+    await query.answer(f"📄 Page {page + 1}/{total_pages}")
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=build_post_channel_keyboard(channels, is_free=is_free, page=page)
+        )
+    except Exception:
+        pass
     return POST_CHANNEL
 
 
@@ -5822,6 +6105,8 @@ def main() -> None:
             POST_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, post_get_text)],
             POST_CHANNEL: [
                 CallbackQueryHandler(cb_post_channel, pattern=r"^post_ch:"),
+                CallbackQueryHandler(cb_post_channel_page, pattern=r"^post_ch_page:"),
+                CallbackQueryHandler(cb_menu_noop, pattern=r"^menu_noop$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, post_get_channel_link),
             ],
             POST_PRICE: [
@@ -5853,6 +6138,8 @@ def main() -> None:
             EC_FIELD: [
                 CallbackQueryHandler(cb_edit_select, pattern=r"^edit_select:"),
                 CallbackQueryHandler(cb_edit_field, pattern=r"^edit_field:"),
+                CallbackQueryHandler(cb_admin_channel_page, pattern=r"^adm_ch_page:edit_select:"),
+                CallbackQueryHandler(cb_menu_noop, pattern=r"^menu_noop$"),
             ],
             EC_VALUE: [
                 MessageHandler(
@@ -5984,6 +6271,10 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_link_chatid,   pattern=r"^link_cid:"))
     app.add_handler(CallbackQueryHandler(cb_back_menu,     pattern=r"^back_menu$"))
     app.add_handler(CallbackQueryHandler(cb_menu_sort,     pattern=r"^menu_sort:"))
+    app.add_handler(CallbackQueryHandler(cb_menu_page,     pattern=r"^menu_page:"))
+    app.add_handler(CallbackQueryHandler(cb_menu_noop,     pattern=r"^menu_noop$"))
+    app.add_handler(CallbackQueryHandler(cb_mypurchases_page, pattern=r"^mypurch_page:"))
+    app.add_handler(CallbackQueryHandler(cb_admin_channel_page, pattern=r"^adm_ch_page:del_channel:"))
     app.add_handler(CallbackQueryHandler(cb_guide_help,    pattern=r"^guide_help$"))
 
     logger.info("Bot is running…")
