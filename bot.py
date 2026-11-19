@@ -1536,13 +1536,225 @@ def extract_clean_title_from_alive_detail(detail: str) -> str:
     return cleaned
 
 
+_GENERIC_TG_PAGE_TITLES = {
+    "not available",
+    "unavailable",
+    "join group chat on telegram",
+    "telegram",
+    "channel not found",
+    "group not found",
+}
+
+_MTPROTO_CLIENT = None
+_MTPROTO_INIT_ATTEMPTED = False
+
+
+def _detect_telegram_ban_reason(raw_html: str, *, allow_web_porn_notice: bool = False) -> str:
+    """
+    Detect Telegram Terms of Service bans, copyright/law blocks, and unavailable notices
+    after unescaping HTML entities (e.g. &#39;, &rsquo;) and normalizing apostrophes.
+    Returns a human-readable dead reason string, or '' if no ban notice is detected.
+    """
+    if not raw_html:
+        return ""
+    unescaped = html.unescape(raw_html)
+    norm = re.sub(r"[\u2018\u2019`´]", "'", unescaped)
+    norm = re.sub(r"\s+", " ", norm).lower()
+
+    # 1. Hard Terms of Service / permanent bans (always dead on any surface)
+    if (
+        "violated telegram's terms of service" in norm
+        or "violated telegrams terms of service" in norm
+        or "violated telegram" in norm
+        or (
+            "terms of service" in norm
+            and any(k in norm for k in ("can't be displayed", "cannot be displayed", "not available", "violated", "blocked"))
+        )
+    ):
+        return "Not available: Violated Telegram's Terms of Service"
+
+    if "copyright infringement" in norm or "violated copyright" in norm:
+        return "Not available: Blocked for copyright infringement"
+
+    if "violated local laws" in norm or "unavailable in your country" in norm or "restricted in your region" in norm:
+        return "Not available: Blocked due to local laws"
+
+    if "because it was blocked" in norm or "channel has been blocked" in norm or "group has been blocked" in norm:
+        return "Channel is blocked/banned by Telegram"
+
+    if any(
+        phrase in norm
+        for phrase in (
+            "channel is inaccessible",
+            "group is inaccessible",
+            "chat is inaccessible",
+            "channel is unavailable",
+            "chat is unavailable",
+            "this channel is not available",
+            "this chat is not available",
+            "this group is not available",
+        )
+    ):
+        return "Channel is not available / inaccessible"
+
+    # 2. Generic "can't be displayed" notices
+    if any(
+        phrase in norm
+        for phrase in (
+            "this channel can't be displayed",
+            "this group can't be displayed",
+            "this chat can't be displayed",
+            "cannot be displayed",
+        )
+    ):
+        # On public ?embed=1 widgets, Telegram shows a web-only NSFW preview notice for live adult channels.
+        # Only skip that notice when allow_web_porn_notice=True and no hard ban phrase matched above.
+        if allow_web_porn_notice and "spread pornographic content" in norm:
+            return ""
+        return "Not available: Channel can't be displayed (Banned/Restricted)"
+
+    return ""
+
+
+async def _check_link_via_mtproto_optional(
+    clean_link: str, is_invite: bool, public_slug: str
+) -> Optional[tuple[bool, str]]:
+    """
+    Optional deep MTProto check via Telethon (active only if TG_API_ID, TG_API_HASH,
+    and TG_STRING_SESSION are set in .env). Detects private-invite restriction_reason
+    (e.g. 'This channel can't be displayed because it violated Telegram's Terms of Service.').
+    Returns (is_alive, reason) if MTProto answered definitively, or None to use HTTP check.
+    """
+    global _MTPROTO_CLIENT, _MTPROTO_INIT_ATTEMPTED
+    api_id_raw = os.getenv("TG_API_ID", "").strip()
+    api_hash = os.getenv("TG_API_HASH", "").strip()
+    str_session = os.getenv("TG_STRING_SESSION", "").strip()
+    if not (api_id_raw.isdigit() and api_hash and str_session):
+        return None
+
+    try:
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+        from telethon.tl.functions.messages import CheckChatInviteRequest
+        from telethon.tl.functions.contacts import ResolveUsernameRequest
+        from telethon.errors import (
+            InviteHashExpiredError,
+            InviteHashInvalidError,
+            ChannelPrivateError,
+            ChannelInvalidError,
+            UsernameInvalidError,
+            UsernameNotOccupiedError,
+        )
+    except Exception:
+        return None
+
+    try:
+        if _MTPROTO_CLIENT is None and not _MTPROTO_INIT_ATTEMPTED:
+            _MTPROTO_INIT_ATTEMPTED = True
+            client = TelegramClient(StringSession(str_session), int(api_id_raw), api_hash)
+            await client.connect()
+            if await client.is_user_authorized():
+                _MTPROTO_CLIENT = client
+            else:
+                await client.disconnect()
+                return None
+
+        if _MTPROTO_CLIENT is None:
+            return None
+        if not _MTPROTO_CLIENT.is_connected():
+            await _MTPROTO_CLIENT.connect()
+
+        def _check_restrictions(obj) -> Optional[str]:
+            for target in (obj, getattr(obj, "chat", None)):
+                if target is None:
+                    continue
+                reasons = getattr(target, "restriction_reason", None) or []
+                for rr in reasons:
+                    r_platform = str(getattr(rr, "platform", "") or "").lower()
+                    r_reason = str(getattr(rr, "reason", "") or "").lower()
+                    r_text = str(getattr(rr, "text", "") or "").strip()
+                    ban_msg = _detect_telegram_ban_reason(r_text, allow_web_porn_notice=True)
+                    if ban_msg:
+                        return ban_msg
+                    if r_platform == "all" and r_reason in ("terms", "tos", "copyright", "law", "illegal", "spam", "violence"):
+                        return f"Not available: {r_text or f'Restricted ({r_reason})'}"
+            return None
+
+        if is_invite:
+            if "/+" in clean_link:
+                inv_hash = clean_link.split("/+", 1)[1].split("?", 1)[0].strip("/")
+            else:
+                inv_hash = re.split(r"joinchat/", clean_link, maxsplit=1, flags=re.IGNORECASE)[1].split("?", 1)[0].strip("/")
+            try:
+                res = await _MTPROTO_CLIENT(CheckChatInviteRequest(inv_hash))
+            except (InviteHashExpiredError, InviteHashInvalidError, ChannelPrivateError, ChannelInvalidError):
+                return False, "Invite link is expired, banned, or invalid"
+            ban_msg = _check_restrictions(res)
+            if ban_msg:
+                return False, ban_msg
+            title = getattr(res, "title", None) or getattr(getattr(res, "chat", None), "title", None) or "Active"
+            count = getattr(res, "participants_count", None)
+            if count:
+                return True, f"{title} ({count} members)"
+            return True, str(title)
+        elif public_slug:
+            try:
+                res = await _MTPROTO_CLIENT(ResolveUsernameRequest(public_slug))
+            except (UsernameInvalidError, UsernameNotOccupiedError, ChannelPrivateError, ChannelInvalidError):
+                return False, "Channel not found or banned"
+            for ch_obj in getattr(res, "chats", None) or []:
+                ban_msg = _check_restrictions(ch_obj)
+                if ban_msg:
+                    return False, ban_msg
+            return None
+    except Exception as exc:
+        logger.debug("[MTPROTO LINK CHECK] Skipped for %s: %s", clean_link, exc)
+    return None
+
+
 async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[bool, str]:
     """
     Check if a Telegram channel link is active and valid.
+    Detects expired/revoked links, deleted channels, and Terms of Service bans
+    ('Not available — This channel can't be displayed because it violated Telegram's Terms of Service.').
     Returns (is_alive: bool, detail_or_reason: str).
     Never deletes any channel messages or deactivates database records.
     """
-    # 1. If chat_id is available and bot is passed, verify via authoritative Telegram Bot API
+    # 1. Normalize the link (preserving exact case of invite hashes)
+    clean_link = (link or "").strip()
+    if not clean_link and not (bot and chat_id):
+        return False, "Empty channel link"
+
+    if clean_link:
+        if clean_link.startswith("@"):
+            clean_link = f"https://t.me/{clean_link.lstrip('@')}"
+        elif not clean_link.startswith(("http://", "https://")):
+            if clean_link.lower().startswith(("t.me/", "telegram.me/")):
+                clean_link = f"https://t.me/{clean_link.split('/', 1)[1]}"
+            else:
+                clean_link = f"https://t.me/{clean_link.lstrip('@')}"
+        else:
+            clean_link = re.sub(
+                r"^https?://(?:www\.)?(?:t\.me|telegram\.me)/",
+                "https://t.me/",
+                clean_link,
+                flags=re.IGNORECASE,
+            )
+        # Normalize preview URLs like https://t.me/s/username -> https://t.me/username
+        clean_link = re.sub(r"^https://t\.me/s/([A-Za-z0-9_]{4,})(?:[/?].*)?$", r"https://t.me/\1", clean_link, flags=re.IGNORECASE)
+
+    is_invite = "/+" in clean_link or "joinchat/" in clean_link.lower()
+    public_slug = ""
+    if not is_invite and "t.me/" in clean_link:
+        tail = clean_link.split("t.me/", 1)[1].split("?", 1)[0].strip("/")
+        first_seg = tail.split("/", 1)[0].strip()
+        if first_seg and not first_seg.startswith("+") and first_seg.lower() not in ("c", "s", "addlist", "joinchat", "proxy", "socks"):
+            public_slug = first_seg.lstrip("@")
+            clean_link = f"https://t.me/{public_slug}"
+
+    # 2. Bot API check (do NOT return True early when clean_link is available, because Telegram
+    #    Bot API getChat still returns ok=true for channels banned for Terms of Service!)
+    api_title = ""
     if bot and chat_id:
         try:
             try:
@@ -1550,43 +1762,42 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
             except (ValueError, TypeError):
                 target_chat_id = chat_id
             chat = await bot.get_chat(target_chat_id)
-            return True, f"{chat.title or 'Active'}"
+            api_title = chat.title or ""
+            if not clean_link:
+                return True, api_title or "Active"
         except Exception as exc:
             err_msg = str(exc).lower()
-            if "chat not found" in err_msg or "deactivated" in err_msg or "channel_banned" in err_msg:
-                return False, f"Telegram API confirmed: {exc}"
-            # For admin/permissions errors, fall through to check the link
+            if any(k in err_msg for k in ("chat not found", "deactivated", "channel_banned", "chat_restricted", "terms of service", "violated")):
+                return False, f"Telegram API confirmed banned/unavailable: {exc}"
 
-    # 2. Normalize the link (preserving exact case of invite hashes)
-    clean_link = (link or "").strip()
-    if not clean_link:
-        return False, "Empty channel link"
+    if bot and public_slug:
+        try:
+            chat = await bot.get_chat(f"@{public_slug}")
+            api_title = api_title or (chat.title or "")
+        except Exception as exc:
+            err_msg = str(exc).lower()
+            if any(k in err_msg for k in ("deactivated", "channel_banned", "chat_restricted", "terms of service", "violated")):
+                return False, f"Channel banned/deactivated ({exc})"
 
-    if clean_link.startswith("@"):
-        clean_link = f"https://t.me/{clean_link.lstrip('@')}"
-    elif not clean_link.startswith(("http://", "https://")):
-        if clean_link.lower().startswith(("t.me/", "telegram.me/")):
-            clean_link = f"https://t.me/{clean_link.split('/', 1)[1]}"
-        else:
-            clean_link = f"https://t.me/{clean_link.lstrip('@')}"
-    else:
-        clean_link = re.sub(r"^https?://(?:www\.)?telegram\.me/", "https://t.me/", clean_link, flags=re.IGNORECASE)
+    # 3. Optional MTProto check (if user session is configured in .env)
+    mtproto_res = await _check_link_via_mtproto_optional(clean_link, is_invite, public_slug)
+    if mtproto_res is not None:
+        return mtproto_res
 
-    is_invite = "/+" in clean_link or "joinchat/" in clean_link.lower()
+    # 4. For public channels, check Telegram's ?embed=1 widget endpoint FIRST because it explicitly
+    #    returns "This channel can't be displayed because it violated Telegram's Terms of Service."
+    embed_ban_reason = ""
+    if public_slug:
+        try:
+            emb_resp = await _ASYNC_HTTP_CLIENT.get(f"https://t.me/{public_slug}/1?embed=1")
+            if emb_resp.status_code == 200:
+                embed_ban_reason = _detect_telegram_ban_reason(emb_resp.text, allow_web_porn_notice=True)
+                if embed_ban_reason:
+                    return False, embed_ban_reason
+        except Exception as exc:
+            logger.debug("[LINK CHECK] Embed check skipped for @%s: %s", public_slug, exc)
 
-    # 3. For public username links (e.g. https://t.me/username), verify via Telegram Bot API first if bot is available
-    if bot and not is_invite and "t.me/" in clean_link:
-        slug = clean_link.split("t.me/", 1)[1].split("?")[0].strip("/")
-        if slug and "/" not in slug and not slug.startswith("+"):
-            try:
-                chat = await bot.get_chat(f"@{slug.lstrip('@')}")
-                return True, f"{chat.title or ('@' + slug)}"
-            except Exception as exc:
-                err_msg = str(exc).lower()
-                if "deactivated" in err_msg or "channel_banned" in err_msg:
-                    return False, f"Channel banned/deactivated ({exc})"
-
-    # 4. Check the web preview of the link on t.me
+    # 5. Check the web preview of the link on t.me
     for attempt in range(2):
         try:
             resp = await _ASYNC_HTTP_CLIENT.get(clean_link)
@@ -1609,17 +1820,10 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
 
             text = resp.text
 
-            # Genuine Telegram dead/banned/blocked indicators:
-            if (
-                "This channel can’t be displayed" in text
-                or "This channel can't be displayed" in text
-                or "because it was blocked" in text
-                or "violated Telegram" in text
-            ):
-                return False, "Channel is blocked/banned by Telegram"
-
-            if "Channel is inaccessible" in text:
-                return False, "Channel is inaccessible"
+            # Check for Terms of Service ban, copyright/law blocks, and unavailable notices (entity-decoded)
+            ban_reason = _detect_telegram_ban_reason(text, allow_web_porn_notice=False)
+            if ban_reason:
+                return False, ban_reason
 
             # Extract channel title and subscriber/member count from t.me preview
             m_title = re.search(
@@ -1632,18 +1836,26 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
             m_extra = re.search(r'class=["\']tgme_page_extra["\'][^>]*>(.*?)</div>', text, re.S)
             extra_str = html.unescape(re.sub(r"<[^>]+>", "", m_extra.group(1)).strip()) if m_extra else ""
 
-            if title_str or extra_str or "tgme_page_title" in text or "tgme_page_extra" in text:
-                if title_str and extra_str:
-                    return True, f"{title_str} ({extra_str})"
-                if title_str:
-                    return True, title_str
-                if extra_str:
-                    return True, f"Active ({extra_str})"
-                return True, "Active"
+            # Reject error / placeholder titles such as "Not available" or "Join group chat on Telegram"
+            if title_str and (
+                title_str.lower() in _GENERIC_TG_PAGE_TITLES
+                or title_str.lower().startswith("telegram: contact @")
+            ):
+                if "not available" in title_str.lower() or "unavailable" in title_str.lower():
+                    return False, "Not available (Channel banned or restricted)"
+                title_str = ""
+
+            if title_str or extra_str:
+                display_title = title_str or api_title
+                if display_title and extra_str:
+                    return True, f"{display_title} ({extra_str})"
+                if display_title:
+                    return True, display_title
+                return True, f"Active ({extra_str})"
 
             if is_invite:
-                return False, "Invite link is expired or invalid"
-            return False, "Channel username not found or invalid"
+                return False, "Invite link is expired, banned, or invalid"
+            return False, embed_ban_reason or "Channel not available, banned, or not found"
 
         except Exception as exc:
             if attempt == 0:
@@ -1935,7 +2147,7 @@ async def cmd_delpost(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 _TG_LINK_EXTRACT_RE = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/(?:\+[A-Za-z0-9_-]+|joinchat/[A-Za-z0-9_-]+|[A-Za-z0-9_]{4,})(?:\?[A-Za-z0-9_=&-]+)?"
+    r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/(?:\+[A-Za-z0-9_-]+|joinchat/[A-Za-z0-9_-]+|s/[A-Za-z0-9_]{4,}|[A-Za-z0-9_]{4,})(?:\?[A-Za-z0-9_=&-]+)?"
     r"|(?<!\S)@[A-Za-z][A-Za-z0-9_]{3,}",
     re.IGNORECASE,
 )
@@ -1944,7 +2156,7 @@ _TG_LINK_EXTRACT_RE = re.compile(
 def _canonical_telegram_link_key(link: str) -> str:
     """
     Build a canonical comparison key for a Telegram channel link so invite links
-    (t.me/+HASH and t.me/joinchat/HASH) and public links (@user and t.me/user) match reliably.
+    (t.me/+HASH and t.me/joinchat/HASH) and public links (@user, t.me/user, t.me/s/user) match reliably.
     """
     raw = (link or "").strip().rstrip(".,;:!)>]}")
     if not raw:
@@ -1963,7 +2175,9 @@ def _canonical_telegram_link_key(link: str) -> str:
         return f"invite:{cleaned[1:]}"
     if cleaned.lower().startswith("joinchat/"):
         return f"invite:{cleaned.split('/', 1)[1].strip('/')}"
-    return f"user:{cleaned.lower()}"
+    if cleaned.lower().startswith("s/"):
+        cleaned = cleaned.split("/", 1)[1].strip("/")
+    return f"user:{cleaned.split('/', 1)[0].lower()}"
 
 
 def extract_telegram_links(raw_text: str, entities=None) -> list[str]:
