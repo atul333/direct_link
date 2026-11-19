@@ -2455,39 +2455,84 @@ def extract_telegram_links(raw_text: str, entities=None) -> list[str]:
 async def _run_checklinks_validation(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE, links: list[str]
 ) -> int:
-    """Validate provided Telegram channel links and return working links without deleting any channel messages."""
+    """
+    Validate provided Telegram channel links without deleting any channel messages.
+    Separates results into:
+    - New working links (not present in active bot channels yet) + tap-to-copy block
+    - Already present channels (extracted separately with existing channel details & live status)
+    - Expired / banned / invalid links
+    """
     msg = await update.effective_message.reply_text(
         f"🔍 <b>Validating {len(links)} channel link(s)...</b>\nPlease wait.",
         parse_mode=ParseMode.HTML,
     )
 
-    working_links: list[tuple[str, str]] = []
+    active_channels = await asyncio.to_thread(db.get_active_channels, DB_PATH)
+    active_by_key: dict[str, dict] = {}
+    for ch in active_channels:
+        ch_link = (row_get(ch, "link") or "").strip()
+        key = _canonical_telegram_link_key(ch_link)
+        if key:
+            active_by_key[key] = dict(ch)
+
+    new_working_links: list[tuple[str, str]] = []
+    already_present_links: list[tuple[str, dict, bool, str]] = []
     dead_links: list[tuple[str, str]] = []
 
     for idx, link in enumerate(links):
         if idx > 0:
             await asyncio.sleep(0.35)
-        is_alive, detail = await check_channel_link_alive(link, bot=ctx.bot)
-        if is_alive:
-            working_links.append((link, detail))
+        canon_key = _canonical_telegram_link_key(link)
+        existing_ch = active_by_key.get(canon_key) if canon_key else None
+        is_alive, detail = await check_channel_link_alive(
+            link,
+            bot=ctx.bot,
+            chat_id=existing_ch.get("chat_id") if existing_ch else None,
+        )
+        if existing_ch:
+            already_present_links.append((link, existing_ch, is_alive, detail))
+        elif is_alive:
+            new_working_links.append((link, detail))
         else:
             dead_links.append((link, detail))
 
     lines: list[str] = [
         "📊 <b>Channel Links Validation Report</b>",
-        f"Total Checked: <b>{len(links)}</b> • ✅ Working: <b>{len(working_links)}</b> • ❌ Not Working: <b>{len(dead_links)}</b>\n",
+        (
+            f"Total Checked: <b>{len(links)}</b> • "
+            f"✅ New Working: <b>{len(new_working_links)}</b> • "
+            f"📌 Already Present: <b>{len(already_present_links)}</b> • "
+            f"❌ Not Working: <b>{len(dead_links)}</b>\n"
+        ),
     ]
 
-    if working_links:
-        lines.append(f"✅ <b>Working Links ({len(working_links)}):</b>")
-        for i, (w_link, w_detail) in enumerate(working_links, 1):
+    if new_working_links:
+        lines.append(f"✅ <b>New Working Links ({len(new_working_links)}):</b>")
+        for i, (w_link, w_detail) in enumerate(new_working_links, 1):
             safe_detail = html.escape(w_detail) if w_detail else "Active"
             lines.append(f"{i}. <code>{html.escape(w_link)}</code> — <b>{safe_detail}</b>")
 
-        only_urls = "\n".join(html.escape(w_link) for w_link, _ in working_links)
-        lines.append(f"\n📋 <b>Working Links Only (Tap to Copy):</b>\n<pre>{only_urls}</pre>")
-    else:
+        only_urls = "\n".join(html.escape(w_link) for w_link, _ in new_working_links)
+        lines.append(f"\n📋 <b>New Working Links Only (Tap to Copy):</b>\n<pre>{only_urls}</pre>")
+    elif already_present_links and not dead_links:
+        lines.append("ℹ️ <b>All provided links are already present in the bot.</b>")
+    elif not already_present_links:
         lines.append("⚠️ <b>No working links found among the provided links.</b>")
+    else:
+        lines.append("ℹ️ <b>No new working links found (valid links are already present in the bot).</b>")
+
+    if already_present_links:
+        lines.append(f"\n📌 <b>Channel Already Present in Bot ({len(already_present_links)}):</b>")
+        for i, (a_link, ch_info, is_alive, detail) in enumerate(already_present_links, 1):
+            ch_name = html.escape(str(ch_info.get("name") or f"Channel #{ch_info.get('id')}"))
+            ch_id = ch_info.get("id")
+            price_val = float(ch_info.get("price_inr") or 0)
+            price_str = "FREE" if price_val <= 0 else f"₹{price_val:.0f}"
+            live_tag = "✅ Working" if is_alive else f"❌ {html.escape(detail)}"
+            lines.append(
+                f"{i}. <code>{html.escape(a_link)}</code> — "
+                f"<b>Channel already present</b> (<b>{ch_name}</b> • ID #{ch_id} • {price_str} • {live_tag})"
+            )
 
     if dead_links:
         lines.append(f"\n❌ <b>Expired / Not Working Links ({len(dead_links)}):</b>")
@@ -2515,7 +2560,7 @@ async def _run_checklinks_validation(
 
 
 async def cmd_checklinks(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    """Admin command: prompt admin to send channel links, then validate and return working links."""
+    """Admin command: prompt admin to send channel links, then validate and extract new working links."""
     user = update.effective_user
     if not user or not is_admin(user.id):
         return ConversationHandler.END
@@ -2531,7 +2576,7 @@ async def cmd_checklinks(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await update.effective_message.reply_text(
         "🔍 <b>Check Channel Links</b>\n\n"
         "Please send the channel link(s) you want to validate (one per line, or separated by spaces).\n\n"
-        "✅ I will check all provided links and return the <b>working links</b>.\n"
+        "✅ I will validate all links, separate any <b>already present channels</b>, and give you the <b>new working links</b>.\n"
         "🛡️ <i>No messages or posts will be deleted from any channel.</i>\n\n"
         "Type /cancel anytime to abort.",
         parse_mode=ParseMode.HTML,
