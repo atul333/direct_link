@@ -2020,17 +2020,93 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
     return False, "Could not verify link"
 
 
-async def cleanup_dead_channel(bot, channel: dict, reason: str) -> int:
+async def cleanup_dead_channel(bot, channel: dict, reason: str) -> dict:
     """
-    No-op: automatic channel post deletion and auto-deactivation have been disabled
-    so the bot never deletes any messages from the channel during link checks.
+    Directly delete published promotional post(s) for an expired/banned channel from
+    the Main Channel (preserving post metadata & photo_file_id in DB for reactivation)
+    and deactivate the channel so it is removed from /menu.
     """
-    logger.info(
-        "Automatic channel post deletion is disabled; skipping cleanup for channel #%s (%s).",
-        channel.get("id"),
-        channel.get("name"),
+    cid = channel["id"]
+    ch_name = (channel.get("name") or f"Channel #{cid}").strip()
+    link = (channel.get("link") or "").strip()
+
+    default_main = await asyncio.to_thread(db.get_setting, DB_PATH, "main_channel_id") or MAIN_CHANNEL_ID
+    posts = await asyncio.to_thread(db.get_posts_for_channel_exact, DB_PATH, cid, link)
+    msg_posts = [p for p in posts if p["channel_msg_id"]]
+
+    deleted_msg_ids: list[int] = []
+    already_gone_ids: list[int] = []
+    delete_errors: list[str] = []
+    attempted_targets: set[tuple[str, int]] = set()
+
+    for p in msg_posts:
+        msg_id = int(p["channel_msg_id"])
+        target = (p["target_channel"] or "").strip() or default_main
+        if not target:
+            delete_errors.append(f"Msg #{msg_id}: no Main Channel configured")
+            continue
+
+        try:
+            target_chat_id = int(target)
+        except (ValueError, TypeError):
+            target_chat_id = target
+
+        dedup_key = (str(target_chat_id), msg_id)
+        if dedup_key in attempted_targets:
+            await asyncio.to_thread(db.clear_post_msg_id, DB_PATH, p["id"])
+            continue
+        attempted_targets.add(dedup_key)
+
+        try:
+            await bot.delete_message(chat_id=target_chat_id, message_id=msg_id)
+            deleted_msg_ids.append(msg_id)
+            await asyncio.to_thread(db.clear_post_msg_id, DB_PATH, p["id"])
+            logger.info(
+                "[AUTO-CLEANUP] Deleted Main Channel post #%d (chat=%s) for dead channel #%d (%s).",
+                msg_id, target_chat_id, cid, ch_name,
+            )
+        except BadRequest as exc:
+            err_low = str(exc).lower()
+            if (
+                "message to delete not found" in err_low
+                or "message_id_invalid" in err_low
+                or "message identifier is not specified" in err_low
+            ):
+                already_gone_ids.append(msg_id)
+                await asyncio.to_thread(db.clear_post_msg_id, DB_PATH, p["id"])
+                logger.info(
+                    "[AUTO-CLEANUP] Post #%d for channel #%d already absent from Telegram; cleared msg_id in DB.",
+                    msg_id, cid,
+                )
+            else:
+                delete_errors.append(f"Msg #{msg_id}: {exc}")
+                logger.warning(
+                    "[AUTO-CLEANUP] Could not delete post #%d (chat=%s) for channel #%d: %s",
+                    msg_id, target_chat_id, cid, exc,
+                )
+        except Exception as exc:
+            delete_errors.append(f"Msg #{msg_id}: {exc}")
+            logger.warning(
+                "[AUTO-CLEANUP] Error deleting post #%d (chat=%s) for channel #%d: %s",
+                msg_id, target_chat_id, cid, exc,
+            )
+
+    # Deactivate channel in DB (preserves channel record, payments, user access & post photo_file_id)
+    await asyncio.to_thread(db.deactivate_channel, DB_PATH, cid, link)
+    invalidate_channel_cache()
+    _MONITOR_NOTIFIED_DEAD.pop(cid, None)
+    logger.warning(
+        "[AUTO-CLEANUP] Deactivated dead channel #%d (%s) — reason: %s | deleted_posts=%s",
+        cid, ch_name, reason, deleted_msg_ids,
     )
-    return 0
+
+    return {
+        "deleted_count": len(deleted_msg_ids),
+        "deleted_msg_ids": deleted_msg_ids,
+        "already_gone_ids": already_gone_ids,
+        "had_posts": len(msg_posts),
+        "delete_errors": delete_errors,
+    }
 
 
 async def republish_channel_post(
@@ -2055,6 +2131,7 @@ async def republish_channel_post(
     # 1. Reactivate channel in DB so existing buyers and new buyers can access it
     await asyncio.to_thread(db.update_channel, DB_PATH, channel_id, is_active=1)
     invalidate_channel_cache()
+    _MONITOR_NOTIFIED_DEAD.pop(channel_id, None)
 
     # 2. Fetch latest post record for this channel (or recover from SQLite raw bytes if previously deleted)
     post = await asyncio.to_thread(
@@ -2139,7 +2216,7 @@ async def republish_channel_post(
 
     final_caption = (
         f"{header_block}"
-        f"<blockquote><b>🌟 Channel:</b> <b>{ch_name}</b>\n"
+        f"<blockquote><b>🌟 Channel:</b> <b>{html.escape(ch_name)}</b>\n"
         f"──────────────────────────\n"
         f"{price_line}"
         f"{payment_mode_line}</blockquote>\n"
@@ -2255,33 +2332,63 @@ async def _get_admin_mention_html(bot, admin_id: int) -> str:
     return mention_link
 
 
-async def _notify_admins_of_dead_channels(bot, dead_items: list[tuple[dict, str]]) -> None:
-    """Send mention notification to all admins with details and quick-action buttons."""
-    if not dead_items:
+async def _notify_admins_of_dead_channels(
+    bot, cleaned_items: list[tuple[dict, str, dict]]
+) -> None:
+    """
+    Send mention alert(s) to all admins after auto-deleting posts and deactivating
+    expired/banned channels, with inline buttons to Re-check and Reactivate & Repost.
+    Batches up to 5 channels per message so every channel gets buttons safely under Telegram limits.
+    """
+    if not cleaned_items:
         return
 
     admin_ids = get_admin_ids()
     if not admin_ids:
         return
 
-    item_blocks: list[str] = []
-    buttons: list[list[InlineKeyboardButton]] = []
+    batch_size = 5
+    total_count = len(cleaned_items)
+    total_batches = (total_count + batch_size - 1) // batch_size
 
-    for idx, (ch, reason) in enumerate(dead_items, 1):
-        cid = ch["id"]
-        ch_name = html.escape((row_get(ch, "name") or f"Channel #{cid}").strip())
-        short_name = (row_get(ch, "name") or f"#{cid}").strip()[:22]
-        link = (row_get(ch, "link") or "").strip()
-        price_val = float(row_get(ch, "price_inr", 0) or 0)
-        price_str = "FREE" if price_val <= 0 else f"₹{price_val:.0f}"
+    for batch_idx in range(total_batches):
+        batch = cleaned_items[batch_idx * batch_size : (batch_idx + 1) * batch_size]
+        start_num = batch_idx * batch_size + 1
 
-        item_blocks.append(
-            f"<b>{idx}. {ch_name}</b> (ID: <code>#{cid}</code> • {price_str})\n"
-            f"🔗 <code>{html.escape(link)}</code>\n"
-            f"⚠️ <b>Status:</b> <i>{html.escape(reason)}</i>"
-        )
+        item_blocks: list[str] = []
+        buttons: list[list[InlineKeyboardButton]] = []
 
-        if idx <= 12:
+        for offset, (ch, reason, cleanup_info) in enumerate(batch):
+            idx = start_num + offset
+            cid = ch["id"]
+            ch_name = html.escape((row_get(ch, "name") or f"Channel #{cid}").strip())
+            short_name = (row_get(ch, "name") or f"#{cid}").strip()[:20]
+            link = (row_get(ch, "link") or "").strip()
+            price_val = float(row_get(ch, "price_inr", 0) or 0)
+            price_str = "FREE" if price_val <= 0 else f"₹{price_val:.0f}"
+
+            del_ids = cleanup_info.get("deleted_msg_ids") or []
+            gone_ids = cleanup_info.get("already_gone_ids") or []
+            del_errs = cleanup_info.get("delete_errors") or []
+            if del_ids:
+                msg_list = ", ".join(f"#{m}" for m in del_ids[:5])
+                post_status = f"🗑️ Main Channel Post Deleted (Msg {msg_list})"
+            elif gone_ids:
+                msg_list = ", ".join(f"#{m}" for m in gone_ids[:5])
+                post_status = f"🗑️ Main Channel Post Already Removed (Msg {msg_list})"
+            elif del_errs:
+                post_status = f"⚠️ Post Delete Error: {html.escape(del_errs[0][:100])}"
+            else:
+                post_status = "ℹ️ No published Main Channel post found"
+
+            item_blocks.append(
+                f"<b>{idx}. {ch_name}</b> (ID: <code>#{cid}</code> • {price_str})\n"
+                f"🔗 <code>{html.escape(link)}</code>\n"
+                f"⚠️ <b>Reason:</b> <i>{html.escape(reason)}</i>\n"
+                f"🔴 <b>Link Deactivated</b> (removed from /menu)\n"
+                f"{post_status}"
+            )
+
             open_url = link if link.startswith(("http://", "https://")) else f"https://t.me/{link.lstrip('@')}"
             row_btns = []
             if open_url.startswith(("http://", "https://")):
@@ -2289,36 +2396,45 @@ async def _notify_admins_of_dead_channels(bot, dead_items: list[tuple[dict, str]
             row_btns.append(InlineKeyboardButton(f"🔄 Re-check #{cid}", callback_data=f"recheck_ch:{cid}"))
             buttons.append(row_btns)
             buttons.append([
-                InlineKeyboardButton(f"🔴 Deactivate #{cid} ({short_name})", callback_data=f"del_channel:{cid}")
+                InlineKeyboardButton(
+                    f"🟢 Reactivate & Repost #{cid} ({short_name})",
+                    callback_data=f"reactivate_ch:{cid}",
+                )
             ])
 
-    body_details = "\n\n".join(item_blocks)
-    reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+        body_details = "\n\n".join(item_blocks)
+        reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+        batch_suffix = f" ({batch_idx + 1}/{total_batches})" if total_batches > 1 else ""
 
-    for aid in admin_ids:
-        try:
-            mention = await _get_admin_mention_html(bot, aid)
-            alert_text = (
-                f"🚨 <b>Channel Link Alert — Action Required</b> 🚨\n"
-                f"👤 Attention {mention}\n\n"
-                f"The 10-minute link checker detected <b>{len(dead_items)}</b> expired or banned active channel link(s):\n\n"
-                f"{body_details}\n\n"
-                f"🛡️ <i>No channel messages were deleted and no channels were auto-removed. "
-                f"Please validate and take necessary action below.</i>"
-            )
-            if len(alert_text) > 4096:
-                alert_text = alert_text[:4000] + "\n\n<i>...run /channels to view full list.</i>"
-            await bot.send_message(
-                chat_id=aid,
-                text=alert_text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True,
-                disable_notification=False,
-            )
-            logger.info("Sent dead-channel mention alert for %d channel(s) to admin %d.", len(dead_items), aid)
-        except Exception as exc:
-            logger.warning("Failed to send dead-channel alert to admin %d: %s", aid, exc)
+        for aid in admin_ids:
+            try:
+                mention = await _get_admin_mention_html(bot, aid)
+                alert_text = (
+                    f"🚨 <b>Expired Link Auto-Cleaned Alert{batch_suffix}</b> 🚨\n"
+                    f"👤 Attention {mention}\n\n"
+                    f"The 10-minute link checker detected <b>{total_count}</b> expired/banned channel(s), "
+                    f"<b>deleted their Main Channel post(s)</b>, and <b>deactivated</b> them from /menu:\n\n"
+                    f"{body_details}\n\n"
+                    f"💡 <i>Tap <b>🔄 Re-check</b> to test if a link is working again, or tap "
+                    f"<b>🟢 Reactivate &amp; Repost</b> to reactivate the link and resend its original post "
+                    f"(previous buyers stay protected).</i>"
+                )
+                if len(alert_text) > 4096:
+                    alert_text = alert_text[:4000] + "\n\n<i>...run /reactivate to view full list.</i>"
+                await bot.send_message(
+                    chat_id=aid,
+                    text=alert_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True,
+                    disable_notification=False,
+                )
+                logger.info(
+                    "Sent expired-channel cleanup alert%s (%d channel(s)) to admin %d.",
+                    batch_suffix, len(batch), aid,
+                )
+            except Exception as exc:
+                logger.warning("Failed to send dead-channel alert to admin %d: %s", aid, exc)
 
 
 async def cb_recheck_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2339,28 +2455,57 @@ async def cb_recheck_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer("❌ Channel not found in database.", show_alert=True)
         return
 
+    link = (row_get(ch, "link", "") or "").strip()
+    ch_name = (row_get(ch, "name", "") or f"Channel #{cid}").strip()
     is_alive, detail = await check_channel_link_alive(
-        row_get(ch, "link", ""), bot=ctx.bot, chat_id=row_get(ch, "chat_id")
+        link, bot=ctx.bot, chat_id=row_get(ch, "chat_id")
     )
     if is_alive:
         _MONITOR_NOTIFIED_DEAD.pop(cid, None)
         await query.answer(f"✅ Channel #{cid} is WORKING!\n{detail[:140]}", show_alert=True)
+        if not ch["is_active"] and query.message:
+            try:
+                await ctx.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    reply_to_message_id=query.message.message_id,
+                    text=(
+                        f"✅ <b>Re-check Passed — Link is Working!</b>\n\n"
+                        f"• <b>Channel:</b> <b>{html.escape(ch_name)}</b> (ID: <code>#{cid}</code>)\n"
+                        f"• <b>Link:</b> <code>{html.escape(link)}</code>\n"
+                        f"• <b>Live Status:</b> <i>{html.escape(detail)}</i>\n\n"
+                        f"Tap below to reactivate this channel and resend its post to the Main Channel:"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(
+                            f"🟢 Reactivate & Repost #{cid} Now",
+                            callback_data=f"reactivate_ch:{cid}",
+                        )],
+                        [InlineKeyboardButton(
+                            f"🔄 Re-check Again #{cid}",
+                            callback_data=f"recheck_ch:{cid}",
+                        )],
+                    ]),
+                )
+            except Exception as exc:
+                logger.debug("Could not send recheck-passed reply for channel #%d: %s", cid, exc)
     else:
         await query.answer(f"❌ Channel #{cid} is STILL DEAD:\n{detail[:140]}", show_alert=True)
 
 
-async def run_periodic_channel_link_check(bot) -> list[tuple[dict, str]]:
+async def run_periodic_channel_link_check(bot) -> list[tuple[dict, str, dict]]:
     """
-    Single pass of the periodic channel link check using the exact same /checklinks logic.
-    Checks all active channels, double-verifies any dead/banned links, and sends a mention
-    notification to admins without deleting any channel messages.
-    Returns list of newly alerted (channel_dict, reason) pairs.
+    Single pass of the periodic 10-minute channel link check using the exact /checklinks logic.
+    Double-verifies any expired/banned active channels, directly deletes their published post(s)
+    from the Main Channel (preserving saved photo/caption/price for reactivation), deactivates
+    the channel, and alerts all admins with Re-check and Reactivate & Repost buttons.
     """
     channels = await asyncio.to_thread(db.get_active_channels, DB_PATH)
     if not channels:
         return []
 
-    remind_after = int(os.getenv("CHANNEL_ALERT_REMIND_SECONDS", "3600"))
+    transient_keywords = ("rate limit", "connection error", "busy", "timeout", "timed out", "could not verify")
     dead_confirmed: list[tuple[dict, str]] = []
     transient_skips = 0
 
@@ -2379,72 +2524,74 @@ async def run_periodic_channel_link_check(bot) -> list[tuple[dict, str]]:
             continue
 
         low_detail = (detail or "").lower()
-        if any(w in low_detail for w in ("rate limit", "connection error", "busy")):
+        if any(w in low_detail for w in transient_keywords):
             transient_skips += 1
             continue
 
-        # Double-verify after short pause to rule out temporary hiccups
-        await asyncio.sleep(1.5)
+        # Double-verify after short pause to rule out temporary hiccups before deleting post
+        await asyncio.sleep(2.0)
         is_alive2, detail2 = await check_channel_link_alive(link, bot=bot, chat_id=chat_id)
         if is_alive2:
             _MONITOR_NOTIFIED_DEAD.pop(cid, None)
             continue
 
         low_detail2 = (detail2 or "").lower()
-        if any(w in low_detail2 for w in ("rate limit", "connection error", "busy")):
+        if any(w in low_detail2 for w in transient_keywords):
             transient_skips += 1
             continue
 
         dead_confirmed.append((dict(ch), detail2 or detail))
 
-    # Circuit breaker: if 4+ active channels exist and EVERY single one failed at once,
-    # treat as a server network issue rather than sending a false alarm.
+    # Circuit breaker: if almost all active channels fail simultaneously in one 10-minute pass,
+    # treat as a server/Telegram network outage rather than mass-deleting live channel posts.
     checked_count = len(channels) - transient_skips
-    if checked_count >= 4 and len(dead_confirmed) == checked_count:
+    mass_failure = (
+        (checked_count >= 4 and len(dead_confirmed) == checked_count)
+        or (checked_count >= 10 and len(dead_confirmed) >= max(8, int(checked_count * 0.7)))
+    )
+    if mass_failure:
         logger.warning(
-            "[10M LINK MONITOR] All %d active channels failed simultaneously — skipping alert (suspected network outage).",
-            checked_count,
+            "[10M LINK MONITOR] %d/%d active channels failed simultaneously — skipping auto-delete (suspected network outage).",
+            len(dead_confirmed), checked_count,
         )
         return []
 
-    now = time.time()
-    to_notify: list[tuple[dict, str]] = []
+    if not dead_confirmed:
+        return []
+
+    cleaned_items: list[tuple[dict, str, dict]] = []
     for ch_dict, reason in dead_confirmed:
-        cid = ch_dict["id"]
-        link = (ch_dict.get("link") or "").strip()
-        prev = _MONITOR_NOTIFIED_DEAD.get(cid)
-        if prev is None or prev[0] != link or (now - prev[1]) >= remind_after:
-            to_notify.append((ch_dict, reason))
-            _MONITOR_NOTIFIED_DEAD[cid] = (link, now)
+        cleanup_info = await cleanup_dead_channel(bot, ch_dict, reason)
+        cleaned_items.append((ch_dict, reason, cleanup_info))
 
-    if to_notify:
-        await _notify_admins_of_dead_channels(bot, to_notify)
-
-    return to_notify
+    await _notify_admins_of_dead_channels(bot, cleaned_items)
+    return cleaned_items
 
 
 async def channel_link_monitor_worker(bot) -> None:
     """
     Background job running every 10 minutes (600s) using the exact same /checklinks validation logic.
-    Checks active channel links for expiry or Telegram Terms of Service bans and sends a mention
-    notification to admins so they can validate and take action (never deletes channel messages).
+    When an active channel link is confirmed expired or banned:
+      1. Deletes its published post(s) from the Main Channel (preserving post media/price in DB).
+      2. Deactivates the channel so it is removed from /menu.
+      3. Sends a mention alert to admins with Re-check and Reactivate & Repost buttons.
     """
     check_interval = int(os.getenv("CHANNEL_MONITOR_INTERVAL_SECONDS", "600"))
     logger.info(
-        "10-minute channel link monitor job started (interval=%ds, notify-only mode — no posts deleted).",
+        "10-minute channel link monitor job started (interval=%ds, auto-delete expired posts & deactivate + admin alert).",
         check_interval,
     )
     while True:
         try:
             await asyncio.sleep(check_interval)
-            alerted = await run_periodic_channel_link_check(bot)
-            if alerted:
+            cleaned = await run_periodic_channel_link_check(bot)
+            if cleaned:
                 logger.warning(
-                    "[10M LINK MONITOR] Alerted admins about %d expired/banned channel(s).",
-                    len(alerted),
+                    "[10M LINK MONITOR] Auto-cleaned %d expired/banned channel(s) and alerted admins.",
+                    len(cleaned),
                 )
             else:
-                logger.info("[10M LINK MONITOR] Periodic check complete — no new expired/banned channels.")
+                logger.info("[10M LINK MONITOR] Periodic check complete — all active channels are working.")
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -4308,7 +4455,8 @@ async def cb_reactivate_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
     if not is_admin(update.effective_user.id):
         return
 
-    arg = query.data.split(":", 1)[1]
+    action_prefix, arg = query.data.split(":", 1)
+    allow_text_only = (action_prefix == "reactivate_text")
     if arg == "all":
         await asyncio.to_thread(db.recover_deleted_posts_from_sqlite_bytes, DB_PATH)
         channels = await asyncio.to_thread(db.get_all_channels, DB_PATH)
@@ -4335,12 +4483,12 @@ async def cb_reactivate_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
         for c in targets:
             ok, info, msg_id = await republish_channel_post(ctx.bot, c["id"])
             if ok:
-                restored.append(f"✅ <b>{c['name']}</b> (Msg #{msg_id})")
+                restored.append(f"✅ <b>{html.escape(c['name'] or '')}</b> (Msg #{msg_id})")
                 await asyncio.sleep(1.0)
             elif info == "NEED_MEDIA":
-                need_media.append(f"📸 <b>{c['name']}</b> (use /editchannel → select {c['name']} → Repost to attach image)")
+                need_media.append(f"📸 <b>{html.escape(c['name'] or '')}</b> (use /editchannel → select {html.escape(c['name'] or '')} → Repost to attach image)")
             else:
-                need_media.append(f"⚠️ <b>{c['name']}</b>: {info}")
+                need_media.append(f"⚠️ <b>{html.escape(c['name'] or '')}</b>: {html.escape(str(info))}")
 
         summary = [f"🎉 <b>Repost Complete! ({len(restored)}/{len(targets)} published)</b>\n"]
         if restored:
@@ -4356,35 +4504,94 @@ async def cb_reactivate_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
     channel_id = int(arg)
     channel = await db_get_channel(channel_id)
     if not channel:
-        await query.edit_message_text("❌ Channel not found.")
+        await query.answer("❌ Channel not found.", show_alert=True)
         return
 
-    await query.edit_message_text(
-        f"⏳ Reactivating <b>{channel['name']}</b> and sending post to Main Channel...",
-        parse_mode=ParseMode.HTML,
+    # Check if this button came from a multi-channel alert so we don't wipe buttons for other channels
+    existing_rows = (
+        query.message.reply_markup.inline_keyboard
+        if (query.message and query.message.reply_markup)
+        else []
     )
-    ok, info, msg_id = await republish_channel_post(ctx.bot, channel_id)
-    if ok:
+    reactivate_targets = {
+        btn.callback_data
+        for row in existing_rows
+        for btn in row
+        if btn.callback_data and btn.callback_data.startswith("reactivate_ch:") and btn.callback_data != "reactivate_ch:all"
+    }
+    is_multi_alert = len(reactivate_targets) > 1
+
+    ch_safe_name = html.escape(channel["name"] or f"Channel #{channel_id}")
+    if not is_multi_alert:
         await query.edit_message_text(
-            f"✅ <b>{channel['name']} Activated & Re-Posted to Main Channel!</b>\n\n"
-            f"• <b>Channel ID:</b> <code>#{channel_id}</code>\n"
-            f"• <b>Main Channel:</b> <code>{info}</code> (Message ID: <code>{msg_id}</code>)\n"
-            f"• <b>Previous Buyers:</b> Protected! (They directly get the channel link — no QR code)\n"
-            f"• <b>New Users:</b> Shown QR code to purchase",
+            f"⏳ Reactivating <b>{ch_safe_name}</b> and sending post to Main Channel...",
             parse_mode=ParseMode.HTML,
         )
+
+    ok, info, msg_id = await republish_channel_post(
+        ctx.bot, channel_id, allow_text_only=allow_text_only
+    )
+    if ok:
+        result_text = (
+            f"✅ <b>{ch_safe_name} Activated &amp; Re-Posted to Main Channel!</b>\n\n"
+            f"• <b>Channel ID:</b> <code>#{channel_id}</code>\n"
+            f"• <b>Main Channel:</b> <code>{html.escape(str(info))}</code> (Message ID: <code>{msg_id}</code>)\n"
+            f"• <b>/menu Status:</b> 🟢 Active\n"
+            f"• <b>Previous Buyers:</b> Protected! (They directly get the channel link — no QR code)\n"
+            f"• <b>New Users:</b> Shown QR code to purchase"
+        )
+        result_markup = None
     elif info == "NEED_MEDIA":
-        await query.edit_message_text(
-            f"🟢 <b>{channel['name']} (ID #{channel_id}) is now Active!</b>\n\n"
-            f"ℹ️ The original image was not found in cache. To post with an image while keeping all previous buyers:\n"
-            f"1. Run <code>/editchannel</code> → select <b>{channel['name']}</b> → tap <b>📢 Repost to Main Channel</b> and send the image,\n"
-            f"2. Or run <code>/post</code> and select <b>{channel['name']}</b> (or paste the same link)!",
+        result_text = (
+            f"🟢 <b>{ch_safe_name} (ID #{channel_id}) is now Active in /menu!</b>\n\n"
+            f"ℹ️ No saved image/video was found for its old post. You can either:\n"
+            f"• Tap <b>📝 Repost Text-Only Post Now</b> below to resend immediately without an image, OR\n"
+            f"• Run <code>/editchannel</code> → select <b>{ch_safe_name}</b> → tap <b>📢 Repost to Main Channel</b> to attach a fresh image."
+        )
+        result_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"📝 Repost Text-Only Post Now (#{channel_id})",
+                callback_data=f"reactivate_text:{channel_id}",
+            )]
+        ])
+    else:
+        result_text = (
+            f"⚠️ Channel <b>{ch_safe_name}</b> (<code>#{channel_id}</code>) activated, "
+            f"but could not post to Main Channel: <code>{html.escape(str(info))}</code>"
+        )
+        result_markup = None
+
+    if is_multi_alert and query.message:
+        # Update only this channel's button in the multi-channel alert & reply with full confirmation
+        if ok:
+            new_rows = []
+            for row in existing_rows:
+                new_row = []
+                for btn in row:
+                    if btn.callback_data == f"reactivate_ch:{channel_id}":
+                        new_row.append(InlineKeyboardButton(
+                            f"✅ Reactivated & Reposted #{channel_id} (Msg #{msg_id})",
+                            callback_data="menu_noop",
+                        ))
+                    else:
+                        new_row.append(btn)
+                new_rows.append(new_row)
+            try:
+                await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_rows))
+            except Exception:
+                pass
+        await ctx.bot.send_message(
+            chat_id=query.message.chat_id,
+            reply_to_message_id=query.message.message_id,
+            text=result_text,
             parse_mode=ParseMode.HTML,
+            reply_markup=result_markup,
         )
     else:
         await query.edit_message_text(
-            f"⚠️ Channel activated, but could not post to Main Channel: <code>{info}</code>",
+            result_text,
             parse_mode=ParseMode.HTML,
+            reply_markup=result_markup,
         )
 
 
@@ -6266,7 +6473,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_adm_force_pay, pattern=r"^adm_force_pay:"))
     app.add_handler(CallbackQueryHandler(cb_del_channel,   pattern=r"^del_channel:"))
     app.add_handler(CallbackQueryHandler(cb_recheck_channel, pattern=r"^recheck_ch:"))
-    app.add_handler(CallbackQueryHandler(cb_reactivate_channel, pattern=r"^reactivate_ch:"))
+    app.add_handler(CallbackQueryHandler(cb_reactivate_channel, pattern=r"^reactivate_(?:ch|text):"))
     app.add_handler(CallbackQueryHandler(cb_del_fwd_post,  pattern=r"^del_fwd_post:"))
     app.add_handler(CallbackQueryHandler(cb_link_chatid,   pattern=r"^link_cid:"))
     app.add_handler(CallbackQueryHandler(cb_back_menu,     pattern=r"^back_menu$"))

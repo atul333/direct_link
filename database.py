@@ -736,20 +736,29 @@ def get_latest_post_for_channel(
     channel_link: str = "",
     channel_name: str = "",
 ) -> Optional[sqlite3.Row]:
-    """Return the most recent post record for a channel (preferring one with a full AgAC photo_file_id)."""
-    posts = get_posts_for_channel(db_path, channel_id, channel_link, channel_name)
-    if not posts:
-        return None
-    with_photo = [
-        p for p in posts
-        if p["photo_file_id"] and str(p["photo_file_id"]).startswith("AgAC")
-    ]
-    if with_photo:
-        return sorted(with_photo, key=lambda r: r["id"], reverse=True)[0]
-    with_media = [p for p in posts if p["photo_file_id"]]
-    if with_media:
-        return sorted(with_media, key=lambda r: r["id"], reverse=True)[0]
-    return sorted(posts, key=lambda r: r["id"], reverse=True)[0]
+    """Return the most recent post record for a channel (preferring exact channel_id and full AgAC photo_file_id)."""
+    def _pick_best(rows: list) -> Optional[sqlite3.Row]:
+        if not rows:
+            return None
+        with_photo = [
+            p for p in rows
+            if p["photo_file_id"] and str(p["photo_file_id"]).startswith("AgAC")
+        ]
+        if with_photo:
+            return sorted(with_photo, key=lambda r: r["id"], reverse=True)[0]
+        with_media = [p for p in rows if p["photo_file_id"]]
+        if with_media:
+            return sorted(with_media, key=lambda r: r["id"], reverse=True)[0]
+        return sorted(rows, key=lambda r: r["id"], reverse=True)[0]
+
+    exact_posts = get_posts_for_channel_exact(db_path, channel_id, channel_link)
+    best_exact = _pick_best(exact_posts)
+    if best_exact and best_exact["photo_file_id"]:
+        return best_exact
+
+    fallback_posts = get_posts_for_channel(db_path, channel_id, channel_link, channel_name)
+    best_fallback = _pick_best(fallback_posts)
+    return best_fallback or best_exact
 
 
 def recover_deleted_posts_from_sqlite_bytes(db_path: str) -> int:
@@ -980,6 +989,24 @@ def get_recent_posts(db_path: str, limit: int = 10) -> list:
         JOIN channels c ON c.id = p.channel_id
         ORDER BY p.id DESC LIMIT ?
     """, (limit,)).fetchall()
+    return rows
+
+
+def get_posts_for_channel_exact(
+    db_path: str, channel_id: int, channel_link: str = ""
+) -> list:
+    """Return promotional posts belonging strictly to channel_id (or duplicate channel rows with exact same link)."""
+    conn = get_connection(db_path)
+    if channel_link and channel_link.strip():
+        rows = conn.execute(
+            "SELECT * FROM posts WHERE channel_id = ? OR channel_id IN (SELECT id FROM channels WHERE link = ?) ORDER BY id DESC",
+            (channel_id, channel_link.strip()),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM posts WHERE channel_id = ? ORDER BY id DESC",
+            (channel_id,),
+        ).fetchall()
     return rows
 
 
