@@ -2021,10 +2021,16 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
         return mtproto_res
 
     # 4. For public channels, check Telegram's ?embed=1 widget endpoint FIRST because it explicitly
-    #    distinguishes Terms of Service bans vs live 18+/sensitive/pornographic channels vs missing channels.
+    #    distinguishes:
+    #      - Terms of Service / copyright / law bans -> non-empty ban text in tgme_widget_message_error (DEAD)
+    #      - Nonexistent / deleted username          -> "Channel with username @... not found" (DEAD)
+    #      - Live 18+ / sensitive-content channels   -> EMPTY tgme_widget_message_error (e.g. @oiMALIBOGonly)
+    #                                                   or pornographic/sensitive notice or live data-peer (ACTIVE)
     embed_ban_reason = ""
     embed_confirmed_adult = False
     embed_confirmed_live_peer = False
+    embed_empty_sensitive_gate = False
+    embed_post_not_found = False
     if public_slug:
         try:
             emb_resp = await _ASYNC_HTTP_CLIENT.get(f"https://t.me/{public_slug}/1?embed=1")
@@ -2035,11 +2041,25 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
                     return False, embed_ban_reason
                 if _is_telegram_adult_sensitive_notice(emb_text):
                     embed_confirmed_adult = True
-                elif (
-                    re.search(r'data-peer=["\']c\d+', emb_text)
-                    or "please open telegram to view this post" in emb_text.lower()
-                ):
-                    embed_confirmed_live_peer = True
+                else:
+                    m_emb_err = re.search(
+                        r'class=["\']tgme_widget_message_error["\'][^>]*>(.*?)</div>',
+                        emb_text,
+                        re.S,
+                    )
+                    if m_emb_err is not None:
+                        emb_err_txt = html.unescape(re.sub(r"<[^>]+>", "", m_emb_err.group(1)).strip())
+                        if emb_err_txt == "":
+                            # Telegram suppresses embed text with an empty error div on live 18+/sensitive channels
+                            embed_empty_sensitive_gate = True
+                        elif emb_err_txt.lower() == "post not found":
+                            # Channel exists (not ToS-banned, not "channel not found"), only post #1 was deleted
+                            embed_post_not_found = True
+                    elif (
+                        re.search(r'data-peer=["\']c\d+', emb_text)
+                        or "please open telegram to view this post" in emb_text.lower()
+                    ):
+                        embed_confirmed_live_peer = True
         except Exception as exc:
             logger.debug("[LINK CHECK] Embed check skipped for @%s: %s", public_slug, exc)
 
@@ -2091,7 +2111,7 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
                 or title_str.lower().startswith("telegram: contact @")
             ):
                 if (
-                    not (is_adult_page or embed_confirmed_adult)
+                    not (is_adult_page or embed_confirmed_adult or embed_empty_sensitive_gate)
                     and ("not available" in title_str.lower() or "unavailable" in title_str.lower())
                 ):
                     return False, "Not available (Channel banned or restricted)"
@@ -2102,18 +2122,32 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
                 if display_title and extra_str:
                     return True, f"{display_title} ({extra_str})"
                 if display_title:
-                    if is_adult_page or embed_confirmed_adult:
+                    if is_adult_page or embed_confirmed_adult or embed_empty_sensitive_gate:
                         return True, f"{display_title} (18+ Sensitive Content)"
                     return True, display_title
                 return True, f"Active ({extra_str})"
 
+            # Check if t.me/<slug> confirms an existing public channel stub ("View in Telegram" / "Preview channel")
+            text_low = text.lower()
+            main_is_channel_stub = bool(public_slug) and (
+                'class="tgme_page_context_link"' in text
+                or "preview channel" in text_low
+                or "view in telegram" in text_low
+                or "you can view posts" in text_low
+            )
+
             # Live 18+ / sensitive content channel where Telegram hides public title/subscriber preview
-            if is_adult_page or embed_confirmed_adult:
+            # (e.g. https://t.me/oiMALIBOGonly -> "18+ sensitive content" modal in app, empty embed error div on web)
+            if (
+                is_adult_page
+                or embed_confirmed_adult
+                or (embed_empty_sensitive_gate and main_is_channel_stub)
+            ):
                 display = api_title or (f"@{public_slug}" if public_slug else "Active")
                 return True, f"{display} (18+ Sensitive Content)"
 
-            # Public channel confirmed live by embed widget peer data / "Please open Telegram to view this post"
-            if embed_confirmed_live_peer:
+            # Public channel confirmed live by embed widget peer data or "Post not found" on an existing channel stub
+            if embed_confirmed_live_peer or (embed_post_not_found and main_is_channel_stub):
                 display = api_title or (f"@{public_slug}" if public_slug else "Active")
                 return True, f"{display} (Active)"
 
