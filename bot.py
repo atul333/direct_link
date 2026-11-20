@@ -1680,10 +1680,15 @@ def extract_clean_title_from_alive_detail(detail: str) -> str:
     """Extract clean channel title from check_channel_link_alive detail string."""
     if not detail:
         return ""
-    cleaned = re.sub(r"\s*\(\d[\d\s,]*\s*(?:subscribers?|members?|online)[^)]*\)\s*$", "", detail, flags=re.I).strip()
+    cleaned = re.sub(
+        r"\s*\((?:\d[\d\s,]*\s*(?:subscribers?|members?|online)[^)]*|18\+\s*Sensitive\s*Content|Active)\)\s*$",
+        "",
+        detail,
+        flags=re.I,
+    ).strip()
     if cleaned.lower() in (
         "active", "active (invite link valid)", "active (telegram invite page)",
-        "join group chat on telegram", "telegram",
+        "join group chat on telegram", "telegram", "18+", "sensitive content",
     ) or cleaned.lower().startswith("active ("):
         return ""
     return cleaned
@@ -1698,21 +1703,75 @@ _GENERIC_TG_PAGE_TITLES = {
     "group not found",
 }
 
+_ADULT_RESTRICTION_REASONS = {"porno", "porn", "sensitive", "adult", "nsfw", "18+", "age"}
+
 _MTPROTO_CLIENT = None
 _MTPROTO_INIT_ATTEMPTED = False
 
 
-def _detect_telegram_ban_reason(raw_html: str, *, allow_web_porn_notice: bool = False) -> str:
-    """
-    Detect Telegram Terms of Service bans, copyright/law blocks, and unavailable notices
-    after unescaping HTML entities (e.g. &#39;, &rsquo;) and normalizing apostrophes.
-    Returns a human-readable dead reason string, or '' if no ban notice is detected.
-    """
+def _normalize_tg_html_text(raw_html: str) -> str:
+    """Unescape HTML entities, normalize curly apostrophes and collapse whitespace to lowercase."""
     if not raw_html:
         return ""
     unescaped = html.unescape(raw_html)
     norm = re.sub(r"[\u2018\u2019`´]", "'", unescaped)
-    norm = re.sub(r"\s+", " ", norm).lower()
+    return re.sub(r"\s+", " ", norm).lower()
+
+
+def _is_telegram_adult_sensitive_notice(raw_html: str) -> bool:
+    """
+    Detect Telegram's 18+ / sensitive / adult content warning or filter notice
+    (e.g. '18+ This chat may contain sensitive content suitable only for adults.
+    Do you still want to view it? Always show 18+ media / View Anyway', or
+    web-preview 'used to spread pornographic content').
+    Channels showing these notices ARE ACTIVE/LIVE — never expired or ToS-banned.
+    """
+    norm = _normalize_tg_html_text(raw_html)
+    if not norm:
+        return False
+
+    direct_phrases = (
+        "may contain sensitive content",
+        "sensitive content suitable only for adults",
+        "suitable only for adults",
+        "always show 18+ media",
+        "show 18+ media",
+        "contains sensitive content",
+        "marked as sensitive",
+        "spread pornographic content",
+        "pornographic content",
+        "contains pornographic",
+        "contains adult content",
+        "adult-only content",
+        "adults-only content",
+        "nsfw content",
+    )
+    if any(p in norm for p in direct_phrases):
+        return True
+
+    # Combined signals from Telegram's 18+ / sensitive modal or preview gates
+    if "18+" in norm and any(k in norm for k in ("sensitive", "adults", "view anyway", "media", "age-restricted", "age restricted")):
+        return True
+    if "sensitive content" in norm and any(k in norm for k in ("this chat", "this channel", "this group", "adults", "view it", "view anyway", "can't be displayed", "cannot be displayed")):
+        return True
+    if ("adult content" in norm or "age-restricted" in norm or "age restricted" in norm) and any(
+        k in norm for k in ("this chat", "this channel", "this group", "can't be displayed", "cannot be displayed", "18+", "view anyway")
+    ):
+        return True
+
+    return False
+
+
+def _detect_telegram_ban_reason(raw_html: str, *, allow_web_porn_notice: bool = True) -> str:
+    """
+    Detect Telegram Terms of Service bans, copyright/law blocks, and unavailable notices
+    after unescaping HTML entities (e.g. &#39;, &rsquo;) and normalizing apostrophes.
+    Explicitly treats 18+ / sensitive / pornographic content warnings as ACTIVE (returns '').
+    Returns a human-readable dead reason string, or '' if no ban notice is detected.
+    """
+    norm = _normalize_tg_html_text(raw_html)
+    if not norm:
+        return ""
 
     # 1. Hard Terms of Service / permanent bans (always dead on any surface)
     if (
@@ -1735,6 +1794,13 @@ def _detect_telegram_ban_reason(raw_html: str, *, allow_web_porn_notice: bool = 
     if "because it was blocked" in norm or "channel has been blocked" in norm or "group has been blocked" in norm:
         return "Channel is blocked/banned by Telegram"
 
+    if "channel with username" in norm and "not found" in norm:
+        return "Channel not found"
+
+    # 2. Live 18+ / sensitive / adult content gates are NEVER considered expired or banned
+    if allow_web_porn_notice and _is_telegram_adult_sensitive_notice(raw_html):
+        return ""
+
     if any(
         phrase in norm
         for phrase in (
@@ -1750,7 +1816,7 @@ def _detect_telegram_ban_reason(raw_html: str, *, allow_web_porn_notice: bool = 
     ):
         return "Channel is not available / inaccessible"
 
-    # 2. Generic "can't be displayed" notices
+    # 3. Generic "can't be displayed" notices (only reached if NOT an 18+/sensitive notice above)
     if any(
         phrase in norm
         for phrase in (
@@ -1760,10 +1826,6 @@ def _detect_telegram_ban_reason(raw_html: str, *, allow_web_porn_notice: bool = 
             "cannot be displayed",
         )
     ):
-        # On public ?embed=1 widgets, Telegram shows a web-only NSFW preview notice for live adult channels.
-        # Only skip that notice when allow_web_porn_notice=True and no hard ban phrase matched above.
-        if allow_web_porn_notice and "spread pornographic content" in norm:
-            return ""
         return "Not available: Channel can't be displayed (Banned/Restricted)"
 
     return ""
@@ -1776,6 +1838,7 @@ async def _check_link_via_mtproto_optional(
     Optional deep MTProto check via Telethon (active only if TG_API_ID, TG_API_HASH,
     and TG_STRING_SESSION are set in .env). Detects private-invite restriction_reason
     (e.g. 'This channel can't be displayed because it violated Telegram's Terms of Service.').
+    Explicitly treats 18+ / sensitive / pornographic restrictions as ACTIVE.
     Returns (is_alive, reason) if MTProto answered definitively, or None to use HTTP check.
     """
     global _MTPROTO_CLIENT, _MTPROTO_INIT_ATTEMPTED
@@ -1817,7 +1880,9 @@ async def _check_link_via_mtproto_optional(
         if not _MTPROTO_CLIENT.is_connected():
             await _MTPROTO_CLIENT.connect()
 
-        def _check_restrictions(obj) -> Optional[str]:
+        def _check_restrictions(obj) -> tuple[Optional[str], bool]:
+            """Returns (hard_ban_msg_or_None, is_adult_sensitive_flag)."""
+            is_adult_flagged = False
             for target in (obj, getattr(obj, "chat", None)):
                 if target is None:
                     continue
@@ -1828,10 +1893,13 @@ async def _check_link_via_mtproto_optional(
                     r_text = str(getattr(rr, "text", "") or "").strip()
                     ban_msg = _detect_telegram_ban_reason(r_text, allow_web_porn_notice=True)
                     if ban_msg:
-                        return ban_msg
+                        return ban_msg, False
+                    if r_reason in _ADULT_RESTRICTION_REASONS or _is_telegram_adult_sensitive_notice(r_text):
+                        is_adult_flagged = True
+                        continue
                     if r_platform == "all" and r_reason in ("terms", "tos", "copyright", "law", "illegal", "spam", "violence"):
-                        return f"Not available: {r_text or f'Restricted ({r_reason})'}"
-            return None
+                        return f"Not available: {r_text or f'Restricted ({r_reason})'}", False
+            return None, is_adult_flagged
 
         if is_invite:
             if "/+" in clean_link:
@@ -1842,23 +1910,30 @@ async def _check_link_via_mtproto_optional(
                 res = await _MTPROTO_CLIENT(CheckChatInviteRequest(inv_hash))
             except (InviteHashExpiredError, InviteHashInvalidError, ChannelPrivateError, ChannelInvalidError):
                 return False, "Invite link is expired, banned, or invalid"
-            ban_msg = _check_restrictions(res)
+            ban_msg, is_adult_flagged = _check_restrictions(res)
             if ban_msg:
                 return False, ban_msg
             title = getattr(res, "title", None) or getattr(getattr(res, "chat", None), "title", None) or "Active"
             count = getattr(res, "participants_count", None)
             if count:
                 return True, f"{title} ({count} members)"
+            if is_adult_flagged:
+                return True, f"{title} (18+ Sensitive Content)"
             return True, str(title)
         elif public_slug:
             try:
                 res = await _MTPROTO_CLIENT(ResolveUsernameRequest(public_slug))
             except (UsernameInvalidError, UsernameNotOccupiedError, ChannelPrivateError, ChannelInvalidError):
                 return False, "Channel not found or banned"
+            adult_title = ""
             for ch_obj in getattr(res, "chats", None) or []:
-                ban_msg = _check_restrictions(ch_obj)
+                ban_msg, is_adult_flagged = _check_restrictions(ch_obj)
                 if ban_msg:
                     return False, ban_msg
+                if is_adult_flagged:
+                    adult_title = getattr(ch_obj, "title", None) or f"@{public_slug}"
+            if adult_title:
+                return True, f"{adult_title} (18+ Sensitive Content)"
             return None
     except Exception as exc:
         logger.debug("[MTPROTO LINK CHECK] Skipped for %s: %s", clean_link, exc)
@@ -1870,6 +1945,8 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
     Check if a Telegram channel link is active and valid.
     Detects expired/revoked links, deleted channels, and Terms of Service bans
     ('Not available — This channel can't be displayed because it violated Telegram's Terms of Service.').
+    Explicitly treats 18+ / sensitive content warning gates ('This chat may contain sensitive content
+    suitable only for adults', 'Always show 18+ media', web NSFW/pornographic preview notices) as ACTIVE.
     Returns (is_alive: bool, detail_or_reason: str).
     Never deletes any channel messages or deactivates database records.
     """
@@ -1920,7 +1997,10 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
                 return True, api_title or "Active"
         except Exception as exc:
             err_msg = str(exc).lower()
-            if any(k in err_msg for k in ("chat not found", "deactivated", "channel_banned", "chat_restricted", "terms of service", "violated")):
+            if (
+                not _is_telegram_adult_sensitive_notice(err_msg)
+                and any(k in err_msg for k in ("chat not found", "deactivated", "channel_banned", "chat_restricted", "terms of service", "violated"))
+            ):
                 return False, f"Telegram API confirmed banned/unavailable: {exc}"
 
     if bot and public_slug:
@@ -1929,7 +2009,10 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
             api_title = api_title or (chat.title or "")
         except Exception as exc:
             err_msg = str(exc).lower()
-            if any(k in err_msg for k in ("deactivated", "channel_banned", "chat_restricted", "terms of service", "violated")):
+            if (
+                not _is_telegram_adult_sensitive_notice(err_msg)
+                and any(k in err_msg for k in ("deactivated", "channel_banned", "chat_restricted", "terms of service", "violated"))
+            ):
                 return False, f"Channel banned/deactivated ({exc})"
 
     # 3. Optional MTProto check (if user session is configured in .env)
@@ -1938,15 +2021,25 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
         return mtproto_res
 
     # 4. For public channels, check Telegram's ?embed=1 widget endpoint FIRST because it explicitly
-    #    returns "This channel can't be displayed because it violated Telegram's Terms of Service."
+    #    distinguishes Terms of Service bans vs live 18+/sensitive/pornographic channels vs missing channels.
     embed_ban_reason = ""
+    embed_confirmed_adult = False
+    embed_confirmed_live_peer = False
     if public_slug:
         try:
             emb_resp = await _ASYNC_HTTP_CLIENT.get(f"https://t.me/{public_slug}/1?embed=1")
             if emb_resp.status_code == 200:
-                embed_ban_reason = _detect_telegram_ban_reason(emb_resp.text, allow_web_porn_notice=True)
+                emb_text = emb_resp.text
+                embed_ban_reason = _detect_telegram_ban_reason(emb_text, allow_web_porn_notice=True)
                 if embed_ban_reason:
                     return False, embed_ban_reason
+                if _is_telegram_adult_sensitive_notice(emb_text):
+                    embed_confirmed_adult = True
+                elif (
+                    re.search(r'data-peer=["\']c\d+', emb_text)
+                    or "please open telegram to view this post" in emb_text.lower()
+                ):
+                    embed_confirmed_live_peer = True
         except Exception as exc:
             logger.debug("[LINK CHECK] Embed check skipped for @%s: %s", public_slug, exc)
 
@@ -1973,10 +2066,13 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
 
             text = resp.text
 
-            # Check for Terms of Service ban, copyright/law blocks, and unavailable notices (entity-decoded)
-            ban_reason = _detect_telegram_ban_reason(text, allow_web_porn_notice=False)
+            # Check for Terms of Service ban, copyright/law blocks, and unavailable notices (entity-decoded).
+            # 18+ / sensitive / pornographic content notices are explicitly allowed and treated as ACTIVE.
+            ban_reason = _detect_telegram_ban_reason(text, allow_web_porn_notice=True)
             if ban_reason:
                 return False, ban_reason
+
+            is_adult_page = _is_telegram_adult_sensitive_notice(text)
 
             # Extract channel title and subscriber/member count from t.me preview
             m_title = re.search(
@@ -1994,7 +2090,10 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
                 title_str.lower() in _GENERIC_TG_PAGE_TITLES
                 or title_str.lower().startswith("telegram: contact @")
             ):
-                if "not available" in title_str.lower() or "unavailable" in title_str.lower():
+                if (
+                    not (is_adult_page or embed_confirmed_adult)
+                    and ("not available" in title_str.lower() or "unavailable" in title_str.lower())
+                ):
                     return False, "Not available (Channel banned or restricted)"
                 title_str = ""
 
@@ -2003,8 +2102,20 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
                 if display_title and extra_str:
                     return True, f"{display_title} ({extra_str})"
                 if display_title:
+                    if is_adult_page or embed_confirmed_adult:
+                        return True, f"{display_title} (18+ Sensitive Content)"
                     return True, display_title
                 return True, f"Active ({extra_str})"
+
+            # Live 18+ / sensitive content channel where Telegram hides public title/subscriber preview
+            if is_adult_page or embed_confirmed_adult:
+                display = api_title or (f"@{public_slug}" if public_slug else "Active")
+                return True, f"{display} (18+ Sensitive Content)"
+
+            # Public channel confirmed live by embed widget peer data / "Please open Telegram to view this post"
+            if embed_confirmed_live_peer:
+                display = api_title or (f"@{public_slug}" if public_slug else "Active")
+                return True, f"{display} (Active)"
 
             if is_invite:
                 return False, "Invite link is expired, banned, or invalid"
