@@ -421,6 +421,25 @@ def get_active_channels(db_path: str) -> list:
     return rows
 
 
+def get_monitorable_channels(db_path: str) -> list:
+    """
+    Return all channels that the 10-minute link monitor should check:
+    - All active channels (is_active = 1), PLUS
+    - Any inactive channel that still has an undeleted Main Channel post
+      (posts.channel_msg_id IS NOT NULL) so expired channels with live posts
+      always trigger an admin alert until deactivated and deleted.
+    """
+    conn = get_connection(db_path)
+    rows = conn.execute("""
+        SELECT DISTINCT c.*
+        FROM channels c
+        LEFT JOIN posts p ON p.channel_id = c.id AND p.channel_msg_id IS NOT NULL
+        WHERE c.is_active = 1 OR p.id IS NOT NULL
+        ORDER BY c.id
+    """).fetchall()
+    return rows
+
+
 def get_all_channels(db_path: str) -> list:
     conn = get_connection(db_path)
     rows = conn.execute("SELECT * FROM channels ORDER BY id").fetchall()
