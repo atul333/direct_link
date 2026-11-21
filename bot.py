@@ -152,7 +152,7 @@ _MANDATORY_CACHE_TTL: float = 900.0          # 15 min — verified users (all jo
 _MANDATORY_CACHE_TTL_PARTIAL: float = 20.0   # 20 sec — unverified users (avoids API storm on rapid taps)
 _mandatory_inflight: dict[int, asyncio.Lock] = {}
 
-# Shared persistent AsyncClient for link health checks
+# Shared persistent AsyncClient for non-Telegram HTTP calls (e.g. OCR fallback)
 _ASYNC_HTTP_CLIENT = httpx.AsyncClient(
     timeout=httpx.Timeout(12.0, connect=5.0),
     follow_redirects=True,
@@ -164,6 +164,39 @@ _ASYNC_HTTP_CLIENT = httpx.AsyncClient(
         )
     },
 )
+
+_TG_WEB_USER_AGENTS = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+)
+_TG_WEB_UA_COUNTER = 0
+_LAST_CONFIRMED_LIVE_INVITE: Optional[str] = None
+
+
+async def _tg_web_get(url: str) -> httpx.Response:
+    """
+    Fetch a t.me web page using a fresh cookie-less HTTP client so Telegram's
+    `stel_ssid` session cookie is NEVER persisted or reused across link checks.
+    (Reusing one `stel_ssid` cookie across dozens of t.me/+ checks causes Telegram
+    to soft-throttle that session into generic 200 OK 'Join group chat on Telegram' pages.)
+    """
+    global _TG_WEB_UA_COUNTER
+    ua = _TG_WEB_USER_AGENTS[_TG_WEB_UA_COUNTER % len(_TG_WEB_USER_AGENTS)]
+    _TG_WEB_UA_COUNTER += 1
+    headers = {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(12.0, connect=5.0),
+        follow_redirects=True,
+        headers=headers,
+    ) as client:
+        return await client.get(url)
 
 # ── Resilient Telegram API wrappers (suppress expired queries, unmodified edits & timeouts) ──
 _orig_callback_query_answer = CallbackQuery.answer
@@ -2040,7 +2073,7 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
     if public_slug:
         for emb_attempt in range(2):
             try:
-                emb_resp = await _ASYNC_HTTP_CLIENT.get(f"https://t.me/{public_slug}/1?embed=1")
+                emb_resp = await _tg_web_get(f"https://t.me/{public_slug}/1?embed=1")
                 embed_status_code = emb_resp.status_code
                 if emb_resp.status_code in (429, 500, 502, 503, 504):
                     if emb_attempt == 0:
@@ -2093,10 +2126,35 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
                 embed_transient_error = True
                 logger.debug("[LINK CHECK] Embed check transient failure for @%s: %s", public_slug, exc)
 
-    # 5. Check the web preview of the link on t.me
+    # 5. Check the web preview of the link on t.me (cookie-less to prevent stel_ssid soft-throttling)
+    global _LAST_CONFIRMED_LIVE_INVITE
+
+    def _extract_tme_title_and_extra(page_html: str) -> tuple[str, str]:
+        m_t = re.search(
+            r'class=["\'][^"\']*\btgme_page_title\b[^"\']*["\'][^>]*>\s*(?:<span[^>]*>)?(.*?)(?:</span>)?\s*</div>',
+            page_html,
+            re.S,
+        )
+        t_val = html.unescape(re.sub(r"<[^>]+>", "", m_t.group(1)).strip()) if m_t else ""
+        if not t_val:
+            m_og = re.search(
+                r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
+                page_html,
+                re.I,
+            )
+            if m_og:
+                t_val = html.unescape(m_og.group(1).strip())
+        m_e = re.search(
+            r'class=["\'][^"\']*\btgme_page_extra\b[^"\']*["\'][^>]*>(.*?)</div>',
+            page_html,
+            re.S,
+        )
+        e_val = html.unescape(re.sub(r"<[^>]+>", "", m_e.group(1)).strip()) if m_e else ""
+        return t_val, e_val
+
     for attempt in range(2):
         try:
-            resp = await _ASYNC_HTTP_CLIENT.get(clean_link)
+            resp = await _tg_web_get(clean_link)
             if resp.status_code in (429, 500, 502, 503, 504):
                 if attempt == 0:
                     await asyncio.sleep(1.5)
@@ -2125,20 +2183,8 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
 
             is_adult_page = _is_telegram_adult_sensitive_notice(text)
 
-            # Extract channel title and subscriber/member count from t.me preview
-            m_title = re.search(
-                r'class=["\'][^"\']*\btgme_page_title\b[^"\']*["\'][^>]*>\s*(?:<span[^>]*>)?(.*?)(?:</span>)?\s*</div>',
-                text,
-                re.S,
-            )
-            title_str = html.unescape(re.sub(r"<[^>]+>", "", m_title.group(1)).strip()) if m_title else ""
-
-            m_extra = re.search(
-                r'class=["\'][^"\']*\btgme_page_extra\b[^"\']*["\'][^>]*>(.*?)</div>',
-                text,
-                re.S,
-            )
-            extra_str = html.unescape(re.sub(r"<[^>]+>", "", m_extra.group(1)).strip()) if m_extra else ""
+            # Extract channel title (tgme_page_title or og:title) and subscriber/member count from t.me preview
+            title_str, extra_str = _extract_tme_title_and_extra(text)
 
             # Reject error / placeholder titles such as "Not available" or "Join group chat on Telegram"
             if title_str and (
@@ -2153,6 +2199,8 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
                 title_str = ""
 
             if title_str or extra_str:
+                if is_invite:
+                    _LAST_CONFIRMED_LIVE_INVITE = clean_link
                 display_title = title_str or api_title
                 if display_title and extra_str:
                     return True, f"{display_title} ({extra_str})"
@@ -2194,12 +2242,41 @@ async def check_channel_link_alive(link: str, bot=None, chat_id=None) -> tuple[b
                     return True, f"{api_title} (18+ Sensitive Content)"
                 return False, "Telegram rate limit / connection error (embed check busy)"
 
-            logger.info(
-                "[LINK CHECK] DEAD %s -> no preview metadata (is_invite=%s, api_title=%r, emb_status=%s, emb_err=%r, stub=%s)",
-                clean_link, is_invite, api_title, embed_status_code, embed_err_snippet, main_is_channel_stub,
-            )
+            # For private invite links returning the generic placeholder page ("Join group chat on Telegram"):
+            # Retry once after brief pause on a fresh cookie-less connection, then verify against a known-live
+            # invite canary to distinguish real expiry from Telegram IP soft-throttling!
             if is_invite:
+                if attempt == 0:
+                    await asyncio.sleep(1.5)
+                    continue
+
+                canary_url = _LAST_CONFIRMED_LIVE_INVITE
+                if canary_url and canary_url != clean_link:
+                    try:
+                        c_resp = await _tg_web_get(canary_url)
+                        if c_resp.status_code == 200:
+                            c_title, c_extra = _extract_tme_title_and_extra(c_resp.text)
+                            if c_title and c_title.lower() in _GENERIC_TG_PAGE_TITLES:
+                                c_title = ""
+                            if not c_title and not c_extra:
+                                logger.warning(
+                                    "[LINK CHECK] Soft-throttle detected on t.me (live canary %s also returned generic page) while checking %s",
+                                    canary_url, clean_link,
+                                )
+                                return False, "Telegram rate limit (t.me temporarily throttling previews — retry in 1–2 min)"
+                    except Exception:
+                        pass
+
+                logger.info(
+                    "[LINK CHECK] DEAD %s -> no preview metadata (is_invite=True, api_title=%r)",
+                    clean_link, api_title,
+                )
                 return False, "Invite link is expired, banned, or invalid"
+
+            logger.info(
+                "[LINK CHECK] DEAD %s -> no preview metadata (is_invite=False, api_title=%r, emb_status=%s, emb_err=%r, stub=%s)",
+                clean_link, api_title, embed_status_code, embed_err_snippet, main_is_channel_stub,
+            )
             return False, embed_ban_reason or "Channel not available, banned, or not found"
 
         except Exception as exc:
@@ -2810,37 +2887,44 @@ async def run_periodic_channel_link_check(bot) -> list[tuple[dict, str, list[int
     ordered_channels.sort(key=lambda r: int(r["id"]))
 
     remind_after = int(os.getenv("CHANNEL_ALERT_REMIND_SECONDS", "3600"))
-    transient_keywords = ("rate limit", "connection error", "busy", "timeout", "timed out", "could not verify")
+    step_delay = float(os.getenv("CHANNEL_MONITOR_STEP_DELAY_SECONDS", "2.0"))
+    transient_keywords = ("rate limit", "connection error", "busy", "timeout", "timed out", "could not verify", "throttling")
     dead_confirmed: list[tuple[dict, str]] = []
+    alive_count = 0
     transient_skips = 0
 
     for idx, ch in enumerate(ordered_channels):
         if idx > 0:
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(step_delay)
         cid = ch["id"]
         link = (ch.get("link") or "").strip()
         chat_id = ch.get("chat_id")
 
         is_alive, detail = await check_channel_link_alive(link, bot=bot, chat_id=chat_id)
         if is_alive:
+            alive_count += 1
             _MONITOR_NOTIFIED_DEAD.pop(cid, None)
             continue
 
         low_detail = (detail or "").lower()
         if any(w in low_detail for w in transient_keywords):
             transient_skips += 1
+            # Back off politely when Telegram soft-throttles t.me previews
+            await asyncio.sleep(15.0)
             continue
 
         # Double-verify after short pause to rule out temporary hiccups
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(2.0)
         is_alive2, detail2 = await check_channel_link_alive(link, bot=bot, chat_id=chat_id)
         if is_alive2:
+            alive_count += 1
             _MONITOR_NOTIFIED_DEAD.pop(cid, None)
             continue
 
         low_detail2 = (detail2 or "").lower()
         if any(w in low_detail2 for w in transient_keywords):
             transient_skips += 1
+            await asyncio.sleep(15.0)
             continue
 
         dead_confirmed.append((ch, detail2 or detail))
@@ -2854,12 +2938,9 @@ async def run_periodic_channel_link_check(bot) -> list[tuple[dict, str, list[int
     )
     if mass_failure:
         logger.warning(
-            "[10M LINK MONITOR] %d/%d channels failed simultaneously — skipping alert (suspected network outage).",
+            "[10M LINK MONITOR] %d/%d channels failed simultaneously — skipping alert (suspected t.me IP throttle or network outage).",
             len(dead_confirmed), checked_count,
         )
-        return []
-
-    if not dead_confirmed:
         return []
 
     now = time.time()
@@ -2873,6 +2954,11 @@ async def run_periodic_channel_link_check(bot) -> list[tuple[dict, str, list[int
             post_msg_ids = sorted({int(p["channel_msg_id"]) for p in posts if p["channel_msg_id"]})
             to_notify.append((ch_dict, reason, post_msg_ids))
             _MONITOR_NOTIFIED_DEAD[cid] = (link, now)
+
+    logger.info(
+        "[10M LINK MONITOR] Pass summary: total=%d | alive=%d | dead=%d | rate_limited=%d | newly_alerted=%d",
+        len(ordered_channels), alive_count, len(dead_confirmed), transient_skips, len(to_notify),
+    )
 
     if to_notify:
         await _notify_admins_of_dead_channels(bot, to_notify)
@@ -3095,7 +3181,7 @@ async def _run_checklinks_validation(
 
     for idx, link in enumerate(links):
         if idx > 0:
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(1.0)
         canon_key = _canonical_telegram_link_key(link)
         existing_ch = active_by_key.get(canon_key) if canon_key else None
         is_alive, detail = await check_channel_link_alive(
