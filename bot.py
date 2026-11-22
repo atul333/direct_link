@@ -1035,8 +1035,8 @@ async def _notify_admins_of_sale(
         uname = format_user_display(user["username"], fallback="None") if user else "None"
         full_name = f"{user['first_name']} {user['last_name']}".strip() if user else "Telegram User"
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        isolated_tx_id = f"CLP5000-{payment_id}" if payment_id and not payment_id.startswith("CLP") else (payment_id or "N/A")
-        isolated_ref_id = f"CLP5000-{order_id}" if order_id and not order_id.startswith("CLP") else order_id
+        raw_payment_id = re.sub(r"^CLP\d+-", "", str(payment_id or "")).strip() or "N/A"
+        raw_order_id = re.sub(r"^CLP\d+-", "", str(order_id or "")).strip() or "N/A"
 
         safe_full_name = html.escape(full_name or "Telegram User")
         safe_channel_name = html.escape(str(channel_name or f"Channel #{channel_id}"))
@@ -1049,9 +1049,9 @@ async def _notify_admins_of_sale(
             f"🏷️ <b>Channel:</b> <b>{safe_channel_name}</b> (<code>#{channel_id}</code>)\n"
             f"🆔 <b>Channel ID:</b> <code>#{channel_id}</code>\n"
             f"💰 <b>Amount Paid:</b> <b>₹{amount:.0f}</b>\n"
+            f"💳 <b>Razorpay Payment ID:</b> <code>{html.escape(raw_payment_id)}</code>\n"
+            f"🧾 <b>Razorpay QR / Ref ID:</b> <code>{html.escape(raw_order_id)}</code>\n"
             f"🔒 <b>Isolated Port:</b> <code>{WEBHOOK_PORT}</code>\n"
-            f"🧾 <b>Payment Ref:</b> <code>{html.escape(str(isolated_ref_id))}</code>\n"
-            f"💳 <b>Transaction ID:</b> <code>{html.escape(str(isolated_tx_id))}</code>\n"
             f"📲 <b>Method:</b> {html.escape(str(method or 'UPI / Auto'))}\n"
             f"⏱️ <b>Time:</b> {now_str}</blockquote>\n\n"
             f"✅ <i>Access link delivered with anti-leak protection! (Port {WEBHOOK_PORT} only)</i>"
