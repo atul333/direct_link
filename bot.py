@@ -430,7 +430,7 @@ def format_channel_menu_label(c, index: int = 1, target_em: float = 50.0) -> str
 def channel_list_keyboard(
     channels: list,
     prefix: str = "buy",
-    sort_by: str = "default",
+    sort_by: str = "price_asc",
     page: int = 0,
     page_size: int = MENU_PAGE_SIZE,
 ) -> InlineKeyboardMarkup:
@@ -4004,8 +4004,9 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await reply_or_send_text(update, ctx, "😔 No channels available right now. Check back soon!")
         return
 
-    sort_by = ctx.user_data.get("menu_sort", "default") if ctx.user_data is not None else "default"
+    sort_by = "price_asc"
     if ctx.user_data is not None:
+        ctx.user_data["menu_sort"] = sort_by
         ctx.user_data["menu_page"] = 0
     text = build_menu_text(len(channels), page=0)
     await reply_or_send_text(
@@ -4348,7 +4349,7 @@ async def cb_back_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return await send_mandatory_channels_prompt(query, ctx, unjoined, "menu")
 
     channels = get_active_channels_cached()
-    sort_by = ctx.user_data.get("menu_sort", "default") if ctx.user_data is not None else "default"
+    sort_by = ctx.user_data.get("menu_sort", "price_asc") if ctx.user_data is not None else "price_asc"
     page = ctx.user_data.get("menu_page", 0) if ctx.user_data is not None else 0
     if channels:
         total_pages = max(1, (len(channels) + MENU_PAGE_SIZE - 1) // MENU_PAGE_SIZE)
@@ -4381,8 +4382,8 @@ async def cb_back_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cb_menu_sort(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle sorting the /menu channel list by price (Low -> High or High -> Low)."""
     query = update.callback_query
-    sort_mode = query.data.split(":", 1)[1] if ":" in query.data else "default"
-    current_sort = ctx.user_data.get("menu_sort", "default") if ctx.user_data is not None else "default"
+    sort_mode = query.data.split(":", 1)[1] if ":" in query.data else "price_asc"
+    current_sort = ctx.user_data.get("menu_sort", "price_asc") if ctx.user_data is not None else "price_asc"
     if sort_mode == current_sort:
         sort_mode = "default"
     if ctx.user_data is not None:
@@ -4426,7 +4427,7 @@ async def cb_menu_page(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     total_pages = max(1, (len(channels) + MENU_PAGE_SIZE - 1) // MENU_PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
-    sort_by = ctx.user_data.get("menu_sort", "default") if ctx.user_data is not None else "default"
+    sort_by = ctx.user_data.get("menu_sort", "price_asc") if ctx.user_data is not None else "price_asc"
     if ctx.user_data is not None:
         ctx.user_data["menu_page"] = page
 
