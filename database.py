@@ -664,11 +664,11 @@ def get_stats(db_path: str) -> dict:
 
     # Revenue per channel
     ch_revenue = conn.execute("""
-        SELECT c.name, COUNT(p.id) as sales, COALESCE(SUM(p.amount_inr),0) as revenue
+        SELECT c.id, c.name, c.is_active, COUNT(p.id) as sales, COALESCE(SUM(p.amount_inr),0) as revenue
         FROM channels c
         LEFT JOIN payments p ON p.channel_id = c.id AND p.status='paid'
         GROUP BY c.id
-        ORDER BY revenue DESC
+        ORDER BY revenue DESC, sales DESC, c.id ASC
     """).fetchall()
 
     return {

@@ -504,7 +504,7 @@ def admin_channel_keyboard(
 
     buttons = [
         [InlineKeyboardButton(
-            f"[{c['id']}] {(c['name'] or '')[:32]} ({'✅' if c['is_active'] else '❌'})",
+            f"[#{c['id']}] {(c['name'] or '')[:30]} ({'✅' if c['is_active'] else '❌'})",
             callback_data=f"{prefix}:{c['id']}"
         )]
         for c in page_channels
@@ -563,7 +563,7 @@ def build_post_channel_keyboard(
     for c in page_channels:
         p_label = "FREE 🎁" if (is_free or float(c["price_inr"] or 0) <= 0) else f"₹{c['price_inr']:.0f}"
         buttons.append([InlineKeyboardButton(
-            f"📌 {(c['name'] or '')[:32]} ({p_label})",
+            f"📌 [#{c['id']}] {(c['name'] or '')[:26]} ({p_label})",
             callback_data=f"post_ch:{c['id']}"
         )])
     if total_pages > 1:
@@ -1038,18 +1038,21 @@ async def _notify_admins_of_sale(
         isolated_tx_id = f"CLP5000-{payment_id}" if payment_id and not payment_id.startswith("CLP") else (payment_id or "N/A")
         isolated_ref_id = f"CLP5000-{order_id}" if order_id and not order_id.startswith("CLP") else order_id
 
+        safe_full_name = html.escape(full_name or "Telegram User")
+        safe_channel_name = html.escape(str(channel_name or f"Channel #{channel_id}"))
         admin_text = (
             "<blockquote><b>💸 New Sale! Payment Auto-Approved</b></blockquote>\n"
             "<blockquote>"
             f"👤 <b>User ID:</b> <code>{user_id}</code>\n"
-            f"👤 <b>Username:</b> {uname}\n"
-            f"👤 <b>Name:</b> {full_name}\n"
-            f"🏷️ <b>Channel:</b> <b>{channel_name}</b>\n"
+            f"👤 <b>Username:</b> {html.escape(uname)}\n"
+            f"👤 <b>Name:</b> {safe_full_name}\n"
+            f"🏷️ <b>Channel:</b> <b>{safe_channel_name}</b> (<code>#{channel_id}</code>)\n"
+            f"🆔 <b>Channel ID:</b> <code>#{channel_id}</code>\n"
             f"💰 <b>Amount Paid:</b> <b>₹{amount:.0f}</b>\n"
             f"🔒 <b>Isolated Port:</b> <code>{WEBHOOK_PORT}</code>\n"
-            f"🧾 <b>Payment Ref:</b> <code>{isolated_ref_id}</code>\n"
-            f"💳 <b>Transaction ID:</b> <code>{isolated_tx_id}</code>\n"
-            f"📲 <b>Method:</b> {method or 'UPI / Auto'}\n"
+            f"🧾 <b>Payment Ref:</b> <code>{html.escape(str(isolated_ref_id))}</code>\n"
+            f"💳 <b>Transaction ID:</b> <code>{html.escape(str(isolated_tx_id))}</code>\n"
+            f"📲 <b>Method:</b> {html.escape(str(method or 'UPI / Auto'))}\n"
             f"⏱️ <b>Time:</b> {now_str}</blockquote>\n\n"
             f"✅ <i>Access link delivered with anti-leak protection! (Port {WEBHOOK_PORT} only)</i>"
         )
@@ -2485,7 +2488,7 @@ async def republish_channel_post(
 
     final_caption = (
         f"{header_block}"
-        f"<blockquote><b>🌟 Channel:</b> <b>{html.escape(ch_name)}</b>\n"
+        f"<blockquote><b>🌟 Channel:</b> <b>{html.escape(ch_name)}</b> (<code>#{channel_id}</code>)\n"
         f"──────────────────────────\n"
         f"{price_line}"
         f"{payment_mode_line}</blockquote>\n"
@@ -4577,31 +4580,13 @@ async def ac_get_chat_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 # ADMIN — EDIT CHANNEL (conversation)
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def cmd_editchannel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    if not is_admin(update.effective_user.id):
-        return ConversationHandler.END
-    channels = db.get_all_channels(DB_PATH)
-    if not channels:
-        await update.message.reply_text("No channels to edit.")
-        return ConversationHandler.END
-    await update.message.reply_text(
-        f"✏️ <b>Edit Channel</b> ({len(channels)} total)\n\nSelect a channel:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=admin_channel_keyboard(channels, "edit_select", page=0),
-    )
-    return EC_FIELD
-
-
-async def cb_edit_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    channel_id = int(query.data.split(":")[1])
-    ctx.user_data["edit_channel_id"] = channel_id
-    channel = db.get_channel(DB_PATH, channel_id)
-    if not channel:
-        await query.edit_message_text("❌ Channel not found.")
-        return ConversationHandler.END
-
+def _build_edit_channel_card(channel) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the channel edit card text (with Name + #ID tag) and action keyboard."""
+    channel_id = channel["id"]
+    safe_name = html.escape((channel["name"] or f"Channel #{channel_id}").strip())
+    safe_link = html.escape((channel["link"] or "").strip())
+    price_val = float(row_get(channel, "price_inr", 0) or 0)
+    price_str = "FREE" if price_val <= 0 else f"₹{price_val:.0f}"
     buttons = [
         [InlineKeyboardButton("📛 Name",        callback_data="edit_field:name")],
         [InlineKeyboardButton("🔗 Link",        callback_data="edit_field:link")],
@@ -4621,14 +4606,68 @@ async def cb_edit_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             InlineKeyboardButton("🔴 Deactivate", callback_data="edit_field:toggle_active")
         ])
 
-    keyboard = InlineKeyboardMarkup(buttons)
     status_str = "✅ Active" if channel["is_active"] else "❌ Inactive"
+    text = (
+        f"✏️ <b>Editing Channel:</b> <b>{safe_name}</b> (<code>#{channel_id}</code>)\n"
+        f"• <b>Channel ID:</b> <code>#{channel_id}</code> • <b>Price:</b> {price_str} • {status_str}\n"
+        f"• <b>Link:</b> <code>{safe_link}</code>\n\n"
+        f"What do you want to change?"
+    )
+    return text, InlineKeyboardMarkup(buttons)
+
+
+async def cmd_editchannel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    # Support direct jump: /editchannel 67 or /editchannel #67
+    if ctx.args:
+        raw_id = ctx.args[0].strip().lstrip("#")
+        if raw_id.isdigit():
+            channel_id = int(raw_id)
+            channel = db.get_channel(DB_PATH, channel_id)
+            if not channel:
+                await update.message.reply_text(
+                    f"❌ Channel <code>#{channel_id}</code> not found.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return ConversationHandler.END
+            ctx.user_data["edit_channel_id"] = channel_id
+            text, keyboard = _build_edit_channel_card(channel)
+            await update.message.reply_text(
+                text, parse_mode=ParseMode.HTML, reply_markup=keyboard, disable_web_page_preview=True
+            )
+            return EC_FIELD
+
+    channels = db.get_all_channels(DB_PATH)
+    if not channels:
+        await update.message.reply_text("No channels to edit.")
+        return ConversationHandler.END
+    await update.message.reply_text(
+        f"✏️ <b>Edit Channel</b> ({len(channels)} total)\n\n"
+        f"Select a channel below (or send <code>/editchannel #ID</code> to jump directly):",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_channel_keyboard(channels, "edit_select", page=0),
+    )
+    return EC_FIELD
+
+
+async def cb_edit_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    channel_id = int(query.data.split(":")[1])
+    ctx.user_data["edit_channel_id"] = channel_id
+    channel = db.get_channel(DB_PATH, channel_id)
+    if not channel:
+        await query.edit_message_text("❌ Channel not found.")
+        return ConversationHandler.END
+
+    text, keyboard = _build_edit_channel_card(channel)
     await query.edit_message_text(
-        f"Editing: <b>{channel['name']}</b> (ID: <code>#{channel_id}</code> — {status_str})\n"
-        f"Link: <code>{channel['link']}</code>\n\n"
-        f"What do you want to change?",
+        text,
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
+        disable_web_page_preview=True,
     )
     return EC_FIELD
 
@@ -4639,9 +4678,10 @@ async def cb_edit_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     field = query.data.split(":")[1]
     ctx.user_data["edit_field"] = field
     channel_id = ctx.user_data["edit_channel_id"]
+    channel = db.get_channel(DB_PATH, channel_id)
+    safe_ch_name = html.escape((channel["name"] if channel else f"Channel #{channel_id}") or f"Channel #{channel_id}")
 
     if field in ("toggle_active", "repost_main"):
-        channel = db.get_channel(DB_PATH, channel_id)
         if not channel:
             await query.edit_message_text("❌ Channel not found.")
             return ConversationHandler.END
@@ -4649,20 +4689,23 @@ async def cb_edit_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if field == "toggle_active" and channel["is_active"]:
             db.update_channel(DB_PATH, channel_id, is_active=0)
             invalidate_channel_cache()
-            await query.edit_message_text(f"🔴 Channel <b>{channel['name']}</b> deactivated ❌", parse_mode=ParseMode.HTML)
+            await query.edit_message_text(
+                f"🔴 Channel <b>{safe_ch_name}</b> (<code>#{channel_id}</code>) deactivated ❌",
+                parse_mode=ParseMode.HTML,
+            )
             return ConversationHandler.END
 
         # Reactivating (or reposting to Main Channel): activate & republish post with original image!
         await query.edit_message_text(
-            f"⏳ Reactivating <b>{channel['name']}</b> and sending post to Main Channel...",
+            f"⏳ Reactivating <b>{safe_ch_name}</b> (<code>#{channel_id}</code>) and sending post to Main Channel...",
             parse_mode=ParseMode.HTML,
         )
         ok, info, msg_id = await republish_channel_post(ctx.bot, channel_id)
         if ok:
             await query.edit_message_text(
-                f"✅ <b>{channel['name']} Activated & Posted to Main Channel!</b>\n\n"
-                f"• <b>Channel ID:</b> <code>#{channel_id}</code>\n"
-                f"• <b>Main Channel:</b> <code>{info}</code> (Message ID: <code>{msg_id}</code>)\n"
+                f"✅ <b>{safe_ch_name}</b> (<code>#{channel_id}</code>) Activated &amp; Posted to Main Channel!\n\n"
+                f"• <b>Channel:</b> <b>{safe_ch_name}</b> (<code>#{channel_id}</code>)\n"
+                f"• <b>Main Channel:</b> <code>{html.escape(str(info))}</code> (Message ID: <code>{msg_id}</code>)\n"
                 f"• <b>Previous Buyers:</b> Kept! (They directly receive the channel link — no QR code)\n"
                 f"• <b>New Users:</b> Shown QR code to purchase",
                 parse_mode=ParseMode.HTML,
@@ -4673,7 +4716,7 @@ async def cb_edit_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if info == "NEED_MEDIA":
             ctx.user_data["edit_field"] = "repost_media"
             await query.edit_message_text(
-                f"🟢 <b>{channel['name']} (ID #{channel_id}) is now Active!</b>\n\n"
+                f"🟢 <b>{safe_ch_name}</b> (<code>#{channel_id}</code>) is now Active!\n\n"
                 f"📸🎬 <b>Send the Photo or Video</b> to publish this channel's post to the Main Channel "
                 f"(or type <code>skip</code> for a text-only post):\n\n"
                 f"✨ <i>Uses the exact same Channel ID (<code>#{channel_id}</code>), so all previous buyers "
@@ -4683,8 +4726,8 @@ async def cb_edit_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             return EC_VALUE
 
         await query.edit_message_text(
-            f"🟢 <b>{channel['name']}</b> is now Active ✅, but could not auto-post to Main Channel:\n"
-            f"<code>{info}</code>",
+            f"🟢 <b>{safe_ch_name}</b> (<code>#{channel_id}</code>) is now Active ✅, but could not auto-post to Main Channel:\n"
+            f"<code>{html.escape(str(info))}</code>",
             parse_mode=ParseMode.HTML,
         )
         ctx.user_data.clear()
@@ -4697,7 +4740,11 @@ async def cb_edit_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         "description": "new description",
         "chat_id": "Channel Chat ID (e.g. -1001234567890 or type 'none' to remove)",
     }
-    await query.message.reply_text(f"Enter the {labels.get(field, field)}:")
+    await query.message.reply_text(
+        f"✏️ Editing <b>{safe_ch_name}</b> (<code>#{channel_id}</code>)\n"
+        f"Enter the {labels.get(field, field)}:",
+        parse_mode=ParseMode.HTML,
+    )
     return EC_VALUE
 
 
@@ -4734,18 +4781,20 @@ async def ec_get_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             custom_media_type=media_type,
             allow_text_only=True,
         )
+        ch_after = db.get_channel(DB_PATH, channel_id)
+        safe_ch_name = html.escape((ch_after["name"] if ch_after else f"Channel #{channel_id}") or f"Channel #{channel_id}")
         ctx.user_data.clear()
         if ok:
             await msg.reply_text(
                 f"🎉 <b>Post Published to Main Channel!</b>\n\n"
-                f"• <b>Channel ID:</b> <code>#{channel_id}</code>\n"
-                f"• <b>Target Channel:</b> <code>{info}</code> (Message ID: <code>{msg_id}</code>)\n"
+                f"• <b>Channel:</b> <b>{safe_ch_name}</b> (<code>#{channel_id}</code>)\n"
+                f"• <b>Target Channel:</b> <code>{html.escape(str(info))}</code> (Message ID: <code>{msg_id}</code>)\n"
                 f"• <b>Previous Buyers:</b> Kept! (Direct link sent — no QR code)\n"
                 f"• <b>New Users:</b> Shown QR code to purchase",
                 parse_mode=ParseMode.HTML,
             )
         else:
-            await msg.reply_text(f"❌ Could not publish post: <code>{info}</code>", parse_mode=ParseMode.HTML)
+            await msg.reply_text(f"❌ Could not publish post: <code>{html.escape(str(info))}</code>", parse_mode=ParseMode.HTML)
         return ConversationHandler.END
 
     if not msg.text:
@@ -4770,13 +4819,16 @@ async def ec_get_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if field == "link":
         db.update_channel(DB_PATH, channel_id, link=value, is_active=1)
         invalidate_channel_cache()
+        updated_ch = db.get_channel(DB_PATH, channel_id) or was_channel
+        safe_ch_name = html.escape((updated_ch["name"] if updated_ch else f"Channel #{channel_id}") or f"Channel #{channel_id}")
         if was_inactive:
             ok, info, msg_id = await republish_channel_post(ctx.bot, channel_id)
             if ok:
                 ctx.user_data.clear()
                 await update.message.reply_text(
                     f"✅ <b>Link updated, channel reactivated, and post re-published to Main Channel!</b>\n\n"
-                    f"• <b>Target Channel:</b> <code>{info}</code> (Message ID: <code>{msg_id}</code>)\n"
+                    f"• <b>Channel:</b> <b>{safe_ch_name}</b> (<code>#{channel_id}</code>)\n"
+                    f"• <b>Target Channel:</b> <code>{html.escape(str(info))}</code> (Message ID: <code>{msg_id}</code>)\n"
                     f"• <b>Previous Buyers:</b> Kept! (No QR code shown to existing buyers)",
                     parse_mode=ParseMode.HTML,
                 )
@@ -4785,12 +4837,15 @@ async def ec_get_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         db.update_channel(DB_PATH, channel_id, **{field: value})
         invalidate_channel_cache()
 
+    updated_ch = db.get_channel(DB_PATH, channel_id) or was_channel
+    safe_ch_name = html.escape((updated_ch["name"] if updated_ch else f"Channel #{channel_id}") or f"Channel #{channel_id}")
     ctx.user_data.clear()
     await update.message.reply_text(
-        "✅ <b>Channel updated successfully!</b>",
+        f"✅ <b>Channel updated successfully!</b>\n\n"
+        f"🏷️ <b>Channel:</b> <b>{safe_ch_name}</b> (<code>#{channel_id}</code>)",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📢 Repost to Main Channel Now", callback_data=f"reactivate_ch:{channel_id}")]
+            [InlineKeyboardButton(f"📢 Repost #{channel_id} to Main Channel Now", callback_data=f"reactivate_ch:{channel_id}")]
         ]),
     )
     return ConversationHandler.END
@@ -5192,16 +5247,9 @@ async def bc_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         return
-    stats = db.get_stats(DB_PATH)
+    stats = await asyncio.to_thread(db.get_stats, DB_PATH)
 
-    ch_lines = ""
-    for ch in stats["channel_breakdown"]:
-        ch_lines += (
-            f"\n  📌 <b>{ch['name']}</b> — "
-            f"{ch['sales']} sales | ₹{ch['revenue']:.0f}"
-        )
-
-    text = (
+    summary_text = (
         "<blockquote><b>📊 Bot Statistics</b></blockquote>\n"
         "<blockquote>"
         f"👥 Total Users:      <b>{stats['total_users']}</b>\n"
@@ -5211,11 +5259,49 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "<blockquote>"
         f"💰 Total Revenue:    <b>₹{stats['total_revenue']:.2f}</b>\n"
         f"✅ Paid Txns:        <b>{stats['total_paid_txns']}</b>\n"
-        f"⏳ Pending Payments: <b>{stats['pending_payments']}</b></blockquote>\n"
-        "<blockquote><b>Per Channel Revenue:</b>"
-        f"{ch_lines or '  None yet'}</blockquote>"
+        f"⏳ Pending Payments: <b>{stats['pending_payments']}</b></blockquote>"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+    breakdown = stats.get("channel_breakdown") or []
+    paid_channels = [ch for ch in breakdown if (ch.get("sales") or 0) > 0 or (ch.get("revenue") or 0) > 0]
+    zero_sales_count = len(breakdown) - len(paid_channels)
+
+    if not paid_channels:
+        footer = (
+            f"\n<blockquote><b>Per Channel Revenue:</b>\n"
+            f"  None yet ({len(breakdown)} channel(s) with 0 sales)</blockquote>"
+        )
+        await update.message.reply_text(summary_text + footer, parse_mode=ParseMode.HTML)
+        return
+
+    entry_lines: list[str] = []
+    for ch in paid_channels:
+        cid = ch.get("id")
+        id_tag = f"<code>#{cid}</code> " if cid is not None else ""
+        dot = "🟢" if ch.get("is_active", 1) else "🔴"
+        safe_name = html.escape(str(ch.get("name") or f"Channel #{cid}"))
+        entry_lines.append(
+            f"\u200e{dot} {id_tag}<b>\u2066{safe_name}\u2069\u200e</b> — "
+            f"{int(ch['sales'])} sales | <b>₹{float(ch['revenue']):.0f}</b>"
+        )
+    if zero_sales_count > 0:
+        entry_lines.append(f"\n<i>ℹ️ +{zero_sales_count} other channel(s) with 0 sales</i>")
+
+    # Pack safely under Telegram's 4096-character limit (chunking into multiple messages if needed)
+    header_prefix = f"{summary_text}\n<blockquote><b>Per Channel Revenue ({len(paid_channels)} with sales):</b>\n"
+    chunks: list[str] = []
+    cur = header_prefix
+    for line in entry_lines:
+        addition = ("\n" if not cur.endswith("\n") else "") + line
+        if len(cur) + len(addition) + len("</blockquote>") > 3800:
+            chunks.append(cur + "</blockquote>")
+            cur = "<blockquote><b>Per Channel Revenue (cont.):</b>\n" + line
+        else:
+            cur += addition
+    chunks.append(cur + "</blockquote>")
+
+    for chunk in chunks:
+        await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -5989,7 +6075,10 @@ async def render_post_preview(message, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     is_free = ctx.user_data.get("is_free", False) or (price is not None and price <= 0)
     link_mode = ctx.user_data.get("free_link_mode", "direct")
 
+    ch_id = channel["id"] if channel else ctx.user_data.get("post_channel_id", "")
     ch_name = channel["name"] if channel else "VIP Channel"
+    safe_ch_name = html.escape(str(ch_name))
+    ch_id_tag = f" (<code>#{ch_id}</code>)" if ch_id else ""
     custom_text = ctx.user_data.get("post_text")
 
     if is_free:
@@ -6032,7 +6121,7 @@ async def render_post_preview(message, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
     preview_caption = (
         f"{header_block}"
-        f"<blockquote><b>🌟 Channel:</b> <b>{ch_name}</b>\n"
+        f"<blockquote><b>🌟 Channel:</b> <b>{safe_ch_name}</b>{ch_id_tag}\n"
         f"──────────────────────────\n"
         f"{price_line}"
         f"{payment_mode_line}</blockquote>\n"
@@ -6108,7 +6197,11 @@ async def render_post_preview(message, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
     await ctx.bot.send_message(
         chat_id=chat_id,
-        text=f"📢 Target: <b>{target}</b>\n\nTap Publish when ready:",
+        text=(
+            f"🏷️ <b>Channel:</b> <b>{safe_ch_name}</b>{ch_id_tag}\n"
+            f"📢 <b>Target:</b> <b>{html.escape(str(target))}</b>\n\n"
+            f"Tap Publish when ready:"
+        ),
         parse_mode=ParseMode.HTML,
         reply_markup=admin_controls,
     )
@@ -6231,13 +6324,15 @@ async def cb_post_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         price_display = "FREE (₹0) 🎁" if is_free else f"₹{price:.0f}"
         button_link_info = f"Direct Channel Link ({channel['link']})" if (is_free and link_mode == "direct") else f"https://t.me/{bot_username}?start={'free' if is_free else 'buy'}_{post_id}"
 
+        safe_pub_ch_name = html.escape(str(channel["name"] if channel else f"Channel #{channel_id}"))
         await query.edit_message_text(
             f"🎉 <b>Post Successfully Published!</b>\n\n"
+            f"🏷️ <b>Channel:</b> <b>{safe_pub_ch_name}</b> (<code>#{channel_id}</code>)\n"
             f"📌 <b>Post ID:</b> <code>{post_id}</code>\n"
-            f"📢 <b>Target Channel:</b> {target}\n"
+            f"📢 <b>Target Channel:</b> {html.escape(str(target))}\n"
             f"🔢 <b>Message ID:</b> <code>{msg.message_id}</code>\n"
             f"💰 <b>Price:</b> {price_display}\n"
-            f"🔗 <b>Button Link:</b> <code>{button_link_info}</code>\n\n"
+            f"🔗 <b>Button Link:</b> <code>{html.escape(button_link_info)}</code>\n\n"
             f"✅ Subscribers can tap the button to join immediately!",
             parse_mode=ParseMode.HTML,
         )
@@ -6280,9 +6375,10 @@ async def cmd_posts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     lines = ["📢 <b>Recent Broadcast Posts</b>\n"]
     for p in posts:
+        safe_p_name = html.escape(str(p["channel_name"] or f"Channel #{p['channel_id']}"))
         lines.append(
-            f"<b>[Post #{p['id']}] {p['channel_name']}</b>\n"
-            f"  💰 Price: ₹{p['price_inr']:.0f} | 📢 Target: <code>{p['target_channel']}</code>\n"
+            f"<b>[Post #{p['id']}] {safe_p_name}</b> (<code>#{p['channel_id']}</code>)\n"
+            f"  💰 Price: ₹{p['price_inr']:.0f} | 📢 Target: <code>{html.escape(str(p['target_channel'] or ''))}</code>\n"
             f"  📅 {p['created_at'][:16]} | 🔢 Msg ID: {p['channel_msg_id'] or 'N/A'}\n"
         )
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
