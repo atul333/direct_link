@@ -4639,13 +4639,13 @@ async def cmd_editchannel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
             )
             return EC_FIELD
 
-    channels = db.get_all_channels(DB_PATH)
+    channels = db.get_active_channels(DB_PATH)
     if not channels:
-        await update.message.reply_text("No channels to edit.")
+        await update.message.reply_text("No active channels to edit.")
         return ConversationHandler.END
     await update.message.reply_text(
-        f"✏️ <b>Edit Channel</b> ({len(channels)} total)\n\n"
-        f"Select a channel below (or send <code>/editchannel #ID</code> to jump directly):",
+        f"✏️ <b>Edit Channel</b> ({len(channels)} active)\n\n"
+        f"Select an active channel below (or send <code>/editchannel #ID</code> to jump directly):",
         parse_mode=ParseMode.HTML,
         reply_markup=admin_channel_keyboard(channels, "edit_select", page=0),
     )
@@ -5096,7 +5096,11 @@ async def cb_admin_channel_page(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         page = 0
 
-    channels = db.get_all_channels(DB_PATH)
+    channels = (
+        db.get_active_channels(DB_PATH)
+        if prefix == "edit_select"
+        else db.get_all_channels(DB_PATH)
+    )
     if not channels:
         await query.answer("No channels found.")
         return EC_FIELD if prefix == "edit_select" else None
