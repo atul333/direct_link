@@ -2634,10 +2634,11 @@ async def _notify_admins_of_dead_channels(
             cid = ch["id"]
             ch_name = html.escape((row_get(ch, "name") or f"Channel #{cid}").strip())
             short_name = (row_get(ch, "name") or f"#{cid}").strip()[:20]
+            safe_ch_name = f"\u2066{ch_name}\u2069\u200e"
+            safe_short_name = f"\u2066{short_name}\u2069\u200e"
             link = (row_get(ch, "link") or "").strip()
             price_val = float(row_get(ch, "price_inr", 0) or 0)
             price_str = "FREE" if price_val <= 0 else f"₹{price_val:.0f}"
-            active_tag = "🟢 Active in /menu" if row_get(ch, "is_active", 1) else "🔴 Inactive in /menu"
 
             if post_msg_ids:
                 msg_list = ", ".join(f"#{m}" for m in post_msg_ids[:5])
@@ -2646,10 +2647,10 @@ async def _notify_admins_of_dead_channels(
                 post_status = "ℹ️ No published Main Channel post in DB"
 
             item_blocks.append(
-                f"<b>{idx}. {ch_name}</b> (ID: <code>#{cid}</code> • {price_str})\n"
+                f"\u200e<b>{idx}. {safe_ch_name}</b> (ID: <code>#{cid}</code> • {price_str})\n"
                 f"🔗 <code>{html.escape(link)}</code>\n"
                 f"⚠️ <b>Status:</b> <i>{html.escape(reason)}</i>\n"
-                f"📌 {active_tag} • {post_status}"
+                f"📌 🟢 Active in /menu • {post_status}"
             )
 
             open_url = link if link.startswith(("http://", "https://")) else f"https://t.me/{link.lstrip('@')}"
@@ -2660,7 +2661,7 @@ async def _notify_admins_of_dead_channels(
             buttons.append(row_btns)
             buttons.append([
                 InlineKeyboardButton(
-                    f"🗑️ Deactivate & Delete Post #{cid} ({short_name})",
+                    f"\u200e🗑️ Deactivate & Delete Post #{cid} ({safe_short_name})",
                     callback_data=f"deactivate_del_ch:{cid}",
                 )
             ])
@@ -2862,19 +2863,21 @@ async def cb_recheck_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 async def run_periodic_channel_link_check(bot) -> list[tuple[dict, str, list[int]]]:
     """
     Single pass of the periodic 10-minute channel link check using the exact /checklinks logic.
-    Checks all active channels (plus any inactive channels that still have an undeleted Main
-    Channel post), double-verifies any dead/banned links, and sends a mention alert to admins
+    Checks ONLY currently ACTIVE channels (is_active = 1) — never scans already-deactivated
+    channels. Double-verifies any dead/banned links and sends a mention alert to admins
     WITHOUT auto-deactivating any link or deleting any channel posts.
     Admin can then tap 'Deactivate & Delete Post' directly from the alert.
     """
-    raw_channels = await asyncio.to_thread(db.get_monitorable_channels, DB_PATH)
+    raw_channels = await asyncio.to_thread(db.get_active_channels, DB_PATH)
     if not raw_channels:
         return []
 
-    # Deduplicate by canonical link (preferring active channel row, then newest ID)
+    # Deduplicate active channels by canonical link (preferring newest ID)
     by_key: dict[str, dict] = {}
     ordered_channels: list[dict] = []
-    for ch in sorted(raw_channels, key=lambda r: (int(bool(row_get(r, "is_active", 0))), int(r["id"])), reverse=True):
+    for ch in sorted(raw_channels, key=lambda r: int(r["id"]), reverse=True):
+        if not row_get(ch, "is_active", 0):
+            continue
         link = (row_get(ch, "link") or "").strip()
         if not link:
             continue
@@ -2947,6 +2950,11 @@ async def run_periodic_channel_link_check(bot) -> list[tuple[dict, str, list[int
     to_notify: list[tuple[dict, str, list[int]]] = []
     for ch_dict, reason in dead_confirmed:
         cid = ch_dict["id"]
+        # Re-check DB right before alerting in case admin deactivated it while the scan was running
+        fresh_ch = await asyncio.to_thread(db.get_channel, DB_PATH, cid)
+        if not fresh_ch or not row_get(fresh_ch, "is_active", 0):
+            _MONITOR_NOTIFIED_DEAD.pop(cid, None)
+            continue
         link = (ch_dict.get("link") or "").strip()
         prev = _MONITOR_NOTIFIED_DEAD.get(cid)
         if prev is None or prev[0] != link or (now - prev[1]) >= remind_after:
