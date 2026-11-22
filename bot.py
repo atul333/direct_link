@@ -331,6 +331,25 @@ def _format_media_badge(media_counts: str) -> str:
     return ""
 
 
+def _extract_videos_count_num(media_counts: str) -> float:
+    """Parse numeric video count from channel media_counts (supports commas and K/M suffixes)."""
+    badge = _format_media_badge(media_counts)
+    if not badge:
+        return 0.0
+    token = badge.split()[0].strip().lower()
+    mult = 1.0
+    if token.endswith("k"):
+        mult = 1_000.0
+        token = token[:-1]
+    elif token.endswith("m"):
+        mult = 1_000_000.0
+        token = token[:-1]
+    try:
+        return float(token) * mult
+    except ValueError:
+        return 0.0
+
+
 def _visual_em_width(text: str) -> float:
     """Estimate visual proportional-font width (in em units relative to \u2800 Braille blank = 1.0)."""
     total = 0.0
@@ -436,7 +455,13 @@ def channel_list_keyboard(
 ) -> InlineKeyboardMarkup:
     sorted_channels = list(channels)
     if sort_by == "price_asc":
-        sorted_channels.sort(key=lambda c: (float(row_get(c, "price_inr", 0) or 0), c["id"]))
+        sorted_channels.sort(
+            key=lambda c: (
+                float(row_get(c, "price_inr", 0) or 0),
+                -_extract_videos_count_num(row_get(c, "media_counts") or ""),
+                c["id"],
+            )
+        )
     elif sort_by == "price_desc":
         sorted_channels.sort(key=lambda c: (-float(row_get(c, "price_inr", 0) or 0), c["id"]))
 
